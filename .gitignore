@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Electron build output
+dist/
+out/
+build/
+release/
+*.exe
+*.msi
+
+# Local launcher state / logs
+launcher-config.json
+*.log
+
+# Environment
+.env
+.env.local
+
+# IDE / editor
+.idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
