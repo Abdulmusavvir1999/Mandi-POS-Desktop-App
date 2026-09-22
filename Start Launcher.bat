@@ -1,5 +1,5 @@
 @echo off
-rem Double-click this to open the Mandi POS Launcher.
+rem Double-click this to open the  POS Launcher.
 rem Opening index.html directly in a browser will NOT work - there is no
 rem preload bridge outside Electron, so every button reports "no bridge".
 cd /d "%~dp0"

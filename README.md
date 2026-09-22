@@ -1,7 +1,7 @@
-# Mandi POS Launcher
+#  POS Launcher
 
 Starts XAMPP MySQL, the POS API and the Angular POS frontend for local
-Mandi Shop POS development.
+ Shop POS development.
 
 ## Requirements
 - Windows
@@ -13,7 +13,7 @@ Mandi Shop POS development.
 npm install
 npm start
 ```
-Or double-click **Mandi POS Launcher** on the Desktop, which runs `Launch.vbs`:
+Or double-click ** POS Launcher** on the Desktop, which runs `Launch.vbs`:
 it clears ELECTRON_RUN_AS_NODE (VS Code and Git Bash set it to 1, which makes
 electron.exe start as plain Node with no window) and opens the app with no
 console window. **Start Launcher.bat** does the same from a console and installs
@@ -60,7 +60,7 @@ Task Manager skips all of this and leaves the services running.
 - **POS API** (`Pos-Backend`, `npm run dev`) and **POS Frontend** (`Pos-Frontend`,
   `npm start`) each open their own CMD window so the logs stay visible. Both
   folders need `npm install` run once before the launcher can start them.
-- The POS API stores its data in SQLite (`Pos-Backend/data/mandi_pos.db`) and
+- The POS API stores its data in SQLite (`Pos-Backend/data/_pos.db`) and
   seeds itself on boot. XAMPP MySQL is started for the MySQL-side tooling -
   phpMyAdmin and the `db:migrate:mysql` / `sync_users` scripts - not because
   the running POS reads from it.

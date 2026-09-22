@@ -1,4 +1,4 @@
-' Opens the Mandi POS Launcher as a desktop app.
+' Opens the  POS Launcher as a desktop app.
 ' Two things this does that a plain shortcut to electron.exe cannot:
 '   - clears ELECTRON_RUN_AS_NODE, which VS Code and Git Bash set to 1 and
 '     which makes electron.exe start as plain Node with no window at all
@@ -17,7 +17,7 @@ sh.Environment("Process").Remove "ELECTRON_RUN_AS_NODE"
 If Not fso.FileExists(exePath) Then
   MsgBox "Electron is not installed yet." & vbCrLf & vbCrLf & _
          "Run ""Start Launcher.bat"" once in:" & vbCrLf & appDir, _
-         vbExclamation, "Mandi POS Launcher"
+         vbExclamation, " POS Launcher"
   WScript.Quit 1
 End If
 

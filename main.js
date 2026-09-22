@@ -47,7 +47,7 @@ let tray = null;
 function ensureTray() {
   if (tray) return;
   tray = new Tray(nativeImage.createFromPath(TRAY_ICON));
-  tray.setToolTip("Mandi POS Launcher - services are running");
+  tray.setToolTip(" POS Launcher - services are running");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "Open launcher", click: showWindow },
     { type: "separator" },
@@ -259,7 +259,7 @@ async function stop(key, entry) {
     await run("taskkill", ["/PID", consoleRootOf(pid, table), "/T", "/F"]);
   }
   // Belt and braces for consoles that do expose their title.
-  await run("taskkill", ["/F", "/FI", `WINDOWTITLE eq Mandi ${name}*`], 8000);
+  await run("taskkill", ["/F", "/FI", `WINDOWTITLE eq  ${name}*`], 8000);
 
   const down = await waitForPortClosed(port, 8000);
   sendStatus({ key, name, running: !down });
@@ -329,7 +329,7 @@ async function launch(key, entry) {
   try {
     const args = mode === "hidden"
       ? ["/c", command]
-      : ["/c", "start", `Mandi ${name}`, "cmd", "/k", command];
+      : ["/c", "start", ` ${name}`, "cmd", "/k", command];
 
     // cmd.exe looks a bare "mysqld.exe" up on PATH, and it only falls back to
     // the current folder when NoDefaultCurrentDirectoryInExePath is unset -
@@ -372,10 +372,10 @@ async function launch(key, entry) {
       return up
         ? { ok: true, key, message: `${name} is up on port ${svc.port}.` }
         : {
-            ok: false,
-            key,
-            message: `${name}: started but port ${svc.port} never opened. ${lastLoggedError(key, cwd) || "Check " + path.join(cwd, "..", "data") + " error logs."}`
-          };
+          ok: false,
+          key,
+          message: `${name}: started but port ${svc.port} never opened. ${lastLoggedError(key, cwd) || "Check " + path.join(cwd, "..", "data") + " error logs."}`
+        };
     }
 
     sendStatus({ key, name, running: true });
