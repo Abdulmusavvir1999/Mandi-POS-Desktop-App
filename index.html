@@ -560,6 +560,57 @@
       background: var(--red)
     }
 
+    /* ---------- addresses to open the POS on ---------- */
+    .links {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      margin-top: 14px
+    }
+
+    .links:empty {
+      display: none
+    }
+
+    .link {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #0b1022;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 6px 6px 6px 12px
+    }
+
+    .link .lbl {
+      font-size: 11px;
+      color: var(--muted);
+      min-width: 58px
+    }
+
+    .link code {
+      flex: 1;
+      min-width: 0;
+      font-family: Consolas, monospace;
+      font-size: 13.5px;
+      color: var(--text);
+      user-select: all;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .link button {
+      padding: 6px 12px;
+      font-size: 12px;
+      min-width: 74px
+    }
+
+    .link button.copied {
+      color: var(--green);
+      border-color: #22c98a66
+    }
+
     /* ---------- collapsible config ---------- */
     .config {
       max-height: 0;
@@ -919,6 +970,7 @@
           </div>
           <div class="chip">:8002</div>
         </div>
+        <div class="links" id="adminLinks"></div>
         <div class="config">
           <div class="pathrow">
             <input id="adminPath" placeholder="Pos-Frontend folder">
@@ -1266,6 +1318,55 @@
       }
     }
 
+    // Where other devices open the POS: this PC's Wi-Fi/LAN IP plus the
+    // frontend port. Re-read now and then because DHCP can hand out a new IP.
+    const FRONTEND_PORT = 8002;
+    let shownLinks = "";
+
+    async function refreshLinks() {
+      if (!api || !api.getAddresses) return;
+      let addrs = [];
+      try { addrs = await api.getAddresses(); } catch { return; }
+      const rows = addrs.map(a => ({ lbl: "Network", text: `${a.address}:${FRONTEND_PORT}`, title: a.name }));
+      rows.push({ lbl: "This PC", text: `localhost:${FRONTEND_PORT}`, title: "Only works on this PC" });
+      const key = rows.map(r => r.text).join("|");
+      if (key === shownLinks) return;
+      shownLinks = key;
+
+      const box = document.getElementById("adminLinks");
+      box.textContent = "";
+      for (const r of rows) {
+        const row = document.createElement("div");
+        row.className = "link";
+        row.title = r.title;
+        const lbl = document.createElement("span");
+        lbl.className = "lbl";
+        lbl.textContent = r.lbl;
+        const code = document.createElement("code");
+        code.textContent = r.text;
+        const btn = document.createElement("button");
+        btn.className = "ghost";
+        btn.textContent = "⧉ Copy";
+        btn.onclick = () => copyLink(btn, r.text);
+        row.append(lbl, code, btn);
+        box.appendChild(row);
+      }
+    }
+
+    async function copyLink(btn, text) {
+      try {
+        if (api.copyText) await api.copyText(text);
+        else await navigator.clipboard.writeText(text);
+        btn.textContent = "✓ Copied";
+        btn.classList.add("copied");
+        log("Copied " + text);
+      } catch (e) {
+        btn.textContent = "Failed";
+        log("Copy failed: " + e.message);
+      }
+      setTimeout(() => { btn.textContent = "⧉ Copy"; btn.classList.remove("copied"); }, 1500);
+    }
+
     async function init() {
       if (!api) {
         show("Launcher bridge missing. Open DevTools (Ctrl+Shift+I) and check for [preload] loaded.", "bad");
@@ -1293,6 +1394,8 @@
       }
       refreshStatus();
       setInterval(refreshStatus, 4000);
+      refreshLinks();
+      setInterval(refreshLinks, 15000);
       if (api.onStatus) {
         api.onStatus(d => {
           const line = `${d.name} ${d.running ? "started" : "stopped"}`;

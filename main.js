@@ -1,8 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, clipboard } = require("electron");
 const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const net = require("net");
+const os = require("os");
 
 const PRELOAD = path.join(__dirname, "preload.js");
 const INDEX = path.join(__dirname, "index.html");
@@ -100,6 +101,24 @@ function readConfig() {
 
 function writeConfig(cfg) {
   fs.writeFileSync(configFile(), JSON.stringify(cfg, null, 2), "utf8");
+}
+
+// IPv4 addresses other devices on the Wi-Fi/LAN can reach this PC on.
+// Hyper-V, WSL, Docker, VirtualBox and VMware adapters only lead into
+// virtual machines on this PC, so they would just be a wrong address to share.
+const VIRTUAL_ADAPTER = /vEthernet|WSL|Hyper-V|Docker|VirtualBox|VMware|Loopback/i;
+
+function lanAddresses() {
+  const found = [];
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (VIRTUAL_ADAPTER.test(name)) continue;
+    for (const a of addrs || []) {
+      if (a.family !== "IPv4" && a.family !== 4) continue;
+      if (a.internal || a.address.startsWith("169.254.")) continue;
+      found.push({ name, address: a.address });
+    }
+  }
+  return found;
 }
 
 function sendStatus(data) {
@@ -536,6 +555,13 @@ app.whenReady().then(() => {
   ipcMain.handle("config:save", (_e, cfg) => {
     writeConfig(cfg);
     return { ok: true };
+  });
+
+  ipcMain.handle("network:addresses", () => lanAddresses());
+
+  ipcMain.handle("clipboard:write", (_e, text) => {
+    clipboard.writeText(String(text));
+    return true;
   });
 
   ipcMain.handle("dialog:browse", async (_e, current) => {

@@ -5,8 +5,10 @@ const { contextBridge, ipcRenderer } = require("electron");
 console.log("[preload] loaded");
 
 contextBridge.exposeInMainWorld("launcher", {
-  bridgeVersion: 5,
+  bridgeVersion: 6,
   getConfig: () => ipcRenderer.invoke("config:get"),
+  getAddresses: () => ipcRenderer.invoke("network:addresses"),
+  copyText: (text) => ipcRenderer.invoke("clipboard:write", text),
   saveConfig: (cfg) => ipcRenderer.invoke("config:save", cfg),
   browse: (current) => ipcRenderer.invoke("dialog:browse", current),
   runService: (svc) => ipcRenderer.invoke("service:run", svc),
