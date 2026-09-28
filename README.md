@@ -43,6 +43,17 @@ Stopping is by port: whatever is LISTENING on the service port is killed, and th
 cmd window it was started in is closed with it. MySQL is asked to shut down with
 mysqladmin first so InnoDB closes cleanly, and is only killed if that fails.
 
+If the XAMPP Control Panel is open and shows MySQL running, the launcher stops
+MySQL through the panel's own Stop button instead (xampp-panel.ps1). The panel
+reports "MySQL shutdown unexpectedly" for any stop it did not start itself, so
+this is what keeps its log at "Attempting to stop MySQL app... / Status change
+detected: stopped". The panel's Stop kills mysqld, so the launcher flushes the
+tables and InnoDB's dirty pages first. A real crash still shows the panel's error.
+
+After MySQL is down, the launcher closes the XAMPP panel with its Quit button, but
+only when every module in it shows Start - quitting with Apache still up would
+leave Apache running with nothing managing it.
+
 ## Closing the window
 If any service is still running, the close button asks first:
 

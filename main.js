@@ -7,6 +7,7 @@ const net = require("net");
 const PRELOAD = path.join(__dirname, "preload.js");
 const INDEX = path.join(__dirname, "index.html");
 const TRAY_ICON = path.join(__dirname, "tray.png");
+const XAMPP_PANEL = path.join(__dirname, "xampp-panel.ps1");
 
 // Pos-Desktop sits next to Pos-Backend and Pos-Frontend in the repo, so the
 // defaults follow the folder rather than one machine's absolute paths.
@@ -234,6 +235,54 @@ async function mysqlShutdown(binPath) {
   return run(exe, ["-u", "root", "--protocol=tcp", "-h", "127.0.0.1", "shutdown"], 20000);
 }
 
+function runOut(exe, args, timeout = 20000) {
+  return new Promise((resolve) => {
+    execFile(exe, args, { windowsHide: true, timeout }, (err, stdout) => resolve(err ? null : String(stdout)));
+  });
+}
+
+// The XAMPP Control Panel prints "MySQL shutdown unexpectedly" whenever mysqld
+// disappears without its own Stop button having been pressed, however cleanly
+// it went. So while the panel is watching MySQL, stop it through that button;
+// see xampp-panel.ps1. Answers "state=Stop" when the panel is watching.
+async function xamppPanel(mode) {
+  if (!fs.existsSync(XAMPP_PANEL)) return "state=none";
+  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", XAMPP_PANEL];
+  if (mode) args.push(mode);
+  const out = await runOut("powershell.exe", args, 30000);
+  return out === null ? "state=error" : out.trim();
+}
+
+// Once MySQL is down the panel has nothing left to do, so close it. It only
+// quits when every module is stopped, and its MySQL button takes a timer tick
+// to flip back to Start after the port closes - hence the retries on "busy".
+async function closeXamppPanel() {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const result = await xamppPanel("-Quit");
+    if (result !== "busy") return result;
+    await wait(1000);
+  }
+  return "busy";
+}
+
+// XAMPP's Stop kills mysqld by PID rather than shutting it down, so first get
+// it to where a kill loses nothing: FLUSH TABLES closes the Aria and MyISAM
+// tables, and a zero dirty-page limit makes InnoDB write its buffer pool out.
+// Committed transactions are already in the redo log either way.
+async function mysqlQuiesce(binPath) {
+  const exe = binPath && path.join(binPath, "mysql.exe");
+  if (!exe || !fs.existsSync(exe)) return;
+  const base = ["-u", "root", "--protocol=tcp", "-h", "127.0.0.1", "-N", "-B", "-e"];
+  await runOut(exe, [...base, "SET GLOBAL innodb_max_dirty_pages_pct = 0; FLUSH TABLES;"]);
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const out = await runOut(exe, [...base, "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_dirty'"], 5000);
+    const dirty = out === null ? NaN : Number(out.trim().split(/\s+/)[1]);
+    if (!(dirty > 0)) return;
+    await wait(500);
+  }
+}
+
 async function stop(key, entry) {
   const svc = SERVICES[key] || { name: key };
   const { name, port } = svc;
@@ -245,10 +294,26 @@ async function stop(key, entry) {
   }
 
   if (key === "mysql") {
-    await mysqlShutdown(entry && entry.path);
+    const binPath = entry && entry.path;
+    // Only while the panel shows MySQL running; with no panel watching,
+    // nothing would complain and mysqladmin's clean shutdown is the better stop.
+    if ((await xamppPanel()) === "state=Stop") {
+      await mysqlQuiesce(binPath);
+      if ((await xamppPanel("-Click")) === "clicked" && (await waitForPortClosed(port, 20000))) {
+        sendStatus({ key, name, running: false });
+        const closed = (await closeXamppPanel()) === "quit";
+        return {
+          ok: true,
+          key,
+          message: `${name} stopped through the XAMPP Control Panel${closed ? ", and the panel was closed" : ""}.`
+        };
+      }
+    }
+    await mysqlShutdown(binPath);
     if (await waitForPortClosed(port, 20000)) {
       sendStatus({ key, name, running: false });
-      return { ok: true, key, message: `${name} shut down cleanly.` };
+      const closed = (await closeXamppPanel()) === "quit";
+      return { ok: true, key, message: `${name} shut down cleanly${closed ? ", and the XAMPP panel was closed" : ""}.` };
     }
   }
 
