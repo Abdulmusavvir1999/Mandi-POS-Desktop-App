@@ -101,12 +101,13 @@ if (Test-Path $envFile) {
   Ok '.env already exists, left as is'
 } else {
   function New-Secret { -join ((1..48) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) }) }
-  # XAMPP's MySQL ships with user root and an empty password. The app reads
+  # XAMPP's MySQL ships with user root and an empty password, granted on
+  # 127.0.0.1 ("localhost" can resolve elsewhere, e.g. to Docker). The app reads
   # LOC_DB_*, the migrator scripts read DB_*, so both are set.
   $values = @{
     'JWT_SECRET' = New-Secret; 'JWT_REFRESH_SECRET' = New-Secret
-    'LOC_DB_HOST' = 'localhost'; 'LOC_DB_PORT' = '3306'; 'LOC_DB_USER' = 'root'; 'LOC_DB_PASS' = ''; 'LOC_DB_NAME' = $DbName
-    'DB_HOST' = 'localhost'; 'DB_PORT' = '3306'; 'DB_USER' = 'root'; 'DB_PASSWORD' = ''; 'DB_NAME' = $DbName
+    'LOC_DB_HOST' = '127.0.0.1'; 'LOC_DB_PORT' = '3306'; 'LOC_DB_USER' = 'root'; 'LOC_DB_PASS' = ''; 'LOC_DB_NAME' = $DbName
+    'DB_HOST' = '127.0.0.1'; 'DB_PORT' = '3306'; 'DB_USER' = 'root'; 'DB_PASSWORD' = ''; 'DB_NAME' = $DbName
   }
   $lines = Get-Content (Join-Path $backend '.env.example') | ForEach-Object {
     if ($_ -match '^([A-Z_]+)=' -and $values.ContainsKey($Matches[1])) { "$($Matches[1])=$($values[$Matches[1]])" } else { $_ }
@@ -131,8 +132,8 @@ if (-not (Test-Port 3306)) {
 }
 Ok 'MySQL is running'
 
-Invoke-Native 'CREATE DATABASE' { & $mysql -u root -e "CREATE DATABASE IF NOT EXISTS $DbName CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
-$tableCount = & $mysql -u root -N -e "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '$DbName'"
+Invoke-Native 'CREATE DATABASE' { & $mysql -h 127.0.0.1 -u root -e "CREATE DATABASE IF NOT EXISTS $DbName CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci" }
+$tableCount = & $mysql -h 127.0.0.1 -u root -N -e "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '$DbName'"
 if ([int]$tableCount -gt 0) {
   Ok "Database already has $tableCount tables, not touching its data"
 } else {
@@ -140,14 +141,14 @@ if ([int]$tableCount -gt 0) {
   # re-encode them and mangle the Arabic dish names in the seed data.
   foreach ($file in 'schema.sql', 'seeders.sql') {
     $path = Join-Path $backend "src\database\$file"
-    Invoke-Native "import $file" { cmd /s /c "`"`"$mysql`" -u root --default-character-set=utf8mb4 $DbName < `"$path`"`"" }
+    Invoke-Native "import $file" { cmd /s /c "`"`"$mysql`" -h 127.0.0.1 -u root --default-character-set=utf8mb4 $DbName < `"$path`"`"" }
     Ok "$file imported"
   }
 }
 
 # Leave MySQL stopped so the launcher starts and owns it.
 if ($startedMysql) {
-  & (Join-Path $MysqlBin 'mysqladmin.exe') -u root shutdown | Out-Null
+  & (Join-Path $MysqlBin 'mysqladmin.exe') -h 127.0.0.1 -u root shutdown | Out-Null
   Ok 'MySQL stopped again (the launcher starts it)'
 }
 
