@@ -7,7 +7,15 @@
 #
 #   xampp-panel.ps1          -> "state=Stop" | "state=Start" | "state=none"
 #   xampp-panel.ps1 -Click   -> "clicked" | "state=..." (button was not Stop)
-#   xampp-panel.ps1 -Quit    -> "quit" | "busy" (a module still runs) | "state=none"
+#   xampp-panel.ps1 -Quit    -> "quit" | "quit-forced" | "busy" (a module still runs) | "state=none"
+#
+# Quit crashes the panel ("Exception EAccessViolation ... Read of address
+# 00000042") whenever it cannot write xampp-control.ini, which the XAMPP
+# installer leaves read-only for non-admins: FormDestroy frees the modules,
+# SaveSettings fails and shows an error box, and the status timer - still
+# running behind that box - touches the freed modules. setup.ps1 grants write
+# access; until it has run, -Quit ends the panel directly instead, which loses
+# nothing because every module is already stopped by then.
 param([switch]$Click, [switch]$Quit)
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +38,9 @@ public static class XamppPanel {
   [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr hwnd);
   [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
   [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder text, int max);
+  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
 
   static string Text(IntPtr hwnd) {
     var sb = new StringBuilder(64);
@@ -80,11 +91,35 @@ public static class XamppPanel {
     IntPtr wParam = (IntPtr)(GetDlgCtrlID(button) & 0xFFFF);
     return SendMessageTimeout(GetParent(button), 0x0111, wParam, button, 0x0002, 15000, out result) != IntPtr.Zero;
   }
+
+  // Quit tears the panel down, so post the click rather than wait inside it.
+  public static bool PressAsync(IntPtr button) {
+    IntPtr wParam = (IntPtr)(GetDlgCtrlID(button) & 0xFFFF);
+    return PostMessage(GetParent(button), 0x0111, wParam, button);
+  }
+
+  // A visible dialog box (#32770) means the panel is showing an error.
+  public static bool HasDialog(int pid) {
+    bool found = false;
+    EnumWindows((top, _) => {
+      uint owner;
+      GetWindowThreadProcessId(top, out owner);
+      if (owner != pid || !IsWindowVisible(top)) return true;
+      var sb = new StringBuilder(32);
+      GetClassName(top, sb, sb.Capacity);
+      if (sb.ToString() == "#32770") { found = true; return false; }
+      return true;
+    }, IntPtr.Zero);
+    return found;
+  }
 }
 "@
 
-$panel = Get-Process xampp-control -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $panel) { 'state=none'; exit 0 }
+# An elevated panel hides its buttons from us, so prefer one we can work.
+$panels = @(Get-Process xampp-control -ErrorAction SilentlyContinue)
+if (-not $panels) { 'state=none'; exit 0 }
+$panel = $panels | Where-Object { [XamppPanel]::FindButtons($_.Id, 'Start', 'Stop').Count -eq 5 } | Select-Object -First 1
+if (-not $panel) { $panel = $panels[0] }
 
 # Quitting the panel leaves whatever it started running with nothing watching
 # it, so only quit once every module's button is back to Start.
@@ -94,7 +129,28 @@ if ($Quit) {
   if ($modules | Where-Object { [XamppPanel]::Caption($_) -eq 'Stop' }) { 'busy'; exit 0 }
   $quitButton = [XamppPanel]::FindButtons($panel.Id, 'Quit') | Select-Object -First 1
   if (-not $quitButton) { 'state=none'; exit 0 }
-  if ([XamppPanel]::Press($quitButton)) { 'quit' } else { 'state=error' }
+
+  # Same user and integrity as the panel (its buttons answered above), so
+  # this is the access its SaveSettings will get.
+  $ini = Join-Path (Split-Path $panel.Path) 'xampp-control.ini'
+  $canSave = $true
+  try { [IO.File]::Open($ini, 'OpenOrCreate', 'ReadWrite', 'ReadWrite').Close() } catch { $canSave = $false }
+
+  if ($canSave -and [XamppPanel]::PressAsync($quitButton)) {
+    $deadline = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $deadline) {
+      if ($panel.WaitForExit(100)) { 'quit'; exit 0 }
+      if ([XamppPanel]::HasDialog($panel.Id)) { break }
+    }
+  }
+
+  # Not saveable, or it errored or hung on the way out: end it before any
+  # crash box shows, along with Windows Error Reporting if it already began.
+  try { Stop-Process -Id $panel.Id -Force } catch { }
+  Get-CimInstance Win32_Process -Filter "Name='WerFault.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match "-p\s+$($panel.Id)\b" } |
+    ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch { } }
+  if ($panel.WaitForExit(3000)) { 'quit-forced' } else { 'state=error' }
   exit 0
 }
 

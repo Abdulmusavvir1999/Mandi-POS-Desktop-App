@@ -70,6 +70,15 @@ Install-WingetPackage 'OpenJS.NodeJS.22' 'Node.js 22 LTS' { [bool](Get-Command n
 Install-WingetPackage 'ApacheFriends.Xampp.8.2' 'XAMPP' { Test-Path (Join-Path $MysqlBin 'mysqld.exe') }
 Ok ("node " + (node -v) + ", npm " + (npm -v) + ", " + (git --version))
 
+# The installer leaves xampp-control.ini read-only for non-admins, and the
+# Control Panel crashes on Quit (EAccessViolation) when it cannot save it.
+# *S-1-5-32-545 is BUILTIN\Users under any Windows display language.
+foreach ($file in 'xampp-control.ini', 'xampp-control.log') {
+  $target = Join-Path $XamppDir $file
+  if (Test-Path $target) { icacls $target /grant '*S-1-5-32-545:M' | Out-Null }
+}
+Ok 'XAMPP Control Panel can save its settings'
+
 # --- 2. Source ---------------------------------------------------------------
 Step "Getting the project into $InstallDir"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null

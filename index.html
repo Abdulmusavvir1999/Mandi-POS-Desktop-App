@@ -302,6 +302,69 @@
       box-shadow: 0 10px 26px #f0556b5c
     }
 
+    .fix {
+      background: linear-gradient(135deg, #f59e0b, #d97706);
+      box-shadow: 0 6px 18px #f59e0b3d;
+      color: #fff;
+    }
+
+    .fix:hover:not(:disabled) {
+      box-shadow: 0 10px 26px #f59e0b5c;
+    }
+
+    /* Fix button in service button rows: hidden by default, shown only when Settings (⚙) is active */
+    .btnrow .fix {
+      display: none;
+    }
+
+    body.show-config .btnrow .fix {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      animation: fadeInFix .25s ease;
+    }
+
+    @keyframes fadeInFix {
+      from {
+        opacity: 0;
+        transform: scale(0.95);
+      }
+      to {
+        opacity: 1;
+        transform: scale(1);
+      }
+    }
+
+    .fix-banner-btn {
+      margin-left: auto;
+      padding: 6px 14px;
+      font-size: 12px;
+      background: linear-gradient(135deg, #f59e0b, #d97706);
+      color: #fff;
+      border: 1px solid #f59e0b88;
+      border-radius: 8px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 650;
+      box-shadow: 0 4px 14px #f59e0b50;
+      cursor: pointer;
+      flex: none;
+      animation: pulseFix 1.8s ease-in-out infinite;
+    }
+
+    @keyframes pulseFix {
+      0%, 100% {
+        transform: scale(1);
+        box-shadow: 0 4px 14px #f59e0b50;
+      }
+      50% {
+        transform: scale(1.04);
+        box-shadow: 0 6px 20px #f59e0b80;
+      }
+    }
+
     .ghost {
       background: #ffffff10;
       border: 1px solid var(--line);
@@ -560,6 +623,24 @@
       background: var(--red)
     }
 
+    .dot.working {
+      background: var(--blue)
+    }
+
+    .dot.working::before,
+    .dot.working::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      border: 1px solid var(--blue);
+      animation: radar 2.2s ease-out infinite
+    }
+
+    .dot.working::after {
+      animation-delay: 1.1s
+    }
+
     /* ---------- addresses to open the POS on ---------- */
     .links {
       display: flex;
@@ -680,6 +761,46 @@
       color: #b6f3d8;
       border-color: #22c98a4d;
       background: #22c98a14
+    }
+
+    .status.working {
+      color: #9fb4ff;
+      border-color: #5b8cff4d;
+      background: #5b8cff14
+    }
+
+    .retry-banner-btn,
+    .fix-banner-btn {
+      margin-left: auto;
+      padding: 6px 13px;
+      font-size: 12px;
+      font-weight: 600;
+      border-radius: 8px;
+      border: 0;
+      cursor: pointer;
+      color: #fff;
+      white-space: nowrap;
+      transition: .2s
+    }
+
+    .retry-banner-btn {
+      background: #3b5bfd;
+      box-shadow: 0 2px 8px #3b5bfd4d
+    }
+
+    .retry-banner-btn:hover {
+      background: #4f6ffd;
+      transform: translateY(-1px)
+    }
+
+    .fix-banner-btn {
+      background: #e69138;
+      box-shadow: 0 2px 8px #e691384d
+    }
+
+    .fix-banner-btn:hover {
+      background: #f09f4a;
+      transform: translateY(-1px)
     }
 
     @keyframes shake {
@@ -895,7 +1016,7 @@
           <div class="sub"> Shop POS · local development</div>
         </div>
         <div class="count" id="count"><b>0</b> / 3 running</div>
-        <button class="gear" id="gear" onclick="toggleConfig()" title="Show folders and commands">⚙</button>
+        <button class="gear" id="gear" onclick="toggleConfig()" title="Settings & Tools" aria-label="Settings">⚙</button>
       </header>
     </div>
 
@@ -928,6 +1049,7 @@
         <div class="btnrow">
           <button class="go" id="mysqlStart" onclick="run('mysql')">Start</button>
           <button class="danger" id="mysqlStop" onclick="stopSvc('mysql')">Stop</button>
+          <button class="fix" id="mysqlFix" onclick="fixMysql(this)" title="Auto-fix table corruption, Aria crashes, or hanging MySQL processes">🔧 Fix</button>
           <span class="state" id="mysqlState"><span class="dot"></span>checking</span>
         </div>
       </div>
@@ -940,13 +1062,13 @@
           <div class="icon">⚙️</div>
           <div>
             <div class="title">POS API</div>
-            <div class="meta">Pos-Backend · own terminal</div>
+            <div class="meta">Advanced-Pos-System-BE · own terminal</div>
           </div>
           <div class="chip">:8000</div>
         </div>
         <div class="config">
           <div class="pathrow">
-            <input id="backendPath" placeholder="Pos-Backend folder">
+            <input id="backendPath" placeholder="Advanced-Pos-System-BE folder">
             <button class="ghost" onclick="browse('backend')">Browse</button>
           </div>
           <input class="cmd" id="backendCmd" placeholder="Terminal command">
@@ -966,14 +1088,14 @@
           <div class="icon">🖥️</div>
           <div>
             <div class="title">POS Frontend</div>
-            <div class="meta">Pos-Frontend · Angular dev server</div>
+            <div class="meta">Advanced-Pos-System-FE · Angular dev server</div>
           </div>
           <div class="chip">:8002</div>
         </div>
         <div class="links" id="adminLinks"></div>
         <div class="config">
           <div class="pathrow">
-            <input id="adminPath" placeholder="Pos-Frontend folder">
+            <input id="adminPath" placeholder="Advanced-Pos-System-FE folder">
             <button class="ghost" onclick="browse('admin')">Browse</button>
           </div>
           <input class="cmd" id="adminCmd" placeholder="Terminal command">
@@ -1027,10 +1149,19 @@
     let busy = false;
     const wasUp = {};
 
-    function show(text, state = "") {
+    function show(text, state = "", allowFix = false, canRetry = false) {
       const el = document.getElementById("status");
+      if (!el) return;
       el.className = "status " + state;
-      el.innerHTML = `<span class="dot ${state}"></span>${text}`;
+      const isMysqlBad = allowFix || (state === "bad" && (text.includes("MySQL") || text.includes("3306") || text.includes("mysqld") || text.includes("0x80000003") || text.includes("InnoD") || text.includes("crashed")));
+      let buttonsHtml = "";
+      if (canRetry || state === "bad") {
+        buttonsHtml += `<button id="retryBtn" class="retry-banner-btn" onclick="runAll()">🔄 Retry</button>`;
+      }
+      if (isMysqlBad) {
+        buttonsHtml += `<button id="autoFixBtn" class="fix-banner-btn" onclick="fixMysql(this)">🔧 Fix MySQL</button>`;
+      }
+      el.innerHTML = `<span class="dot ${state}"></span><span style="flex:1;min-width:0;line-height:1.4">${text.replace(/\n/g, "<br>")}</span>` + buttonsHtml;
     }
 
     function log(line) {
@@ -1041,10 +1172,14 @@
       el.scrollTop = el.scrollHeight;
     }
 
-    // The folders and commands stay in the page so the launcher can read them;
-    // the gear just reveals them when something needs changing.
+    // The folders, commands, and repair tools stay in the page;
+    // the gear/settings button reveals them when needed.
     function toggleConfig() {
-      document.body.classList.toggle("show-config");
+      const active = document.body.classList.toggle("show-config");
+      const gear = document.getElementById("gear");
+      if (gear) {
+        gear.title = active ? "Hide settings" : "Settings & Tools";
+      }
     }
 
     function readConfig() {
@@ -1089,12 +1224,17 @@
 
     function setBusy(state, keys) {
       busy = state;
-      document.querySelectorAll("button").forEach(b => b.disabled = state);
+      document.querySelectorAll("button").forEach(b => {
+        if (b.id !== "retryBtn" || state) b.disabled = state;
+      });
       for (const key of keys || []) {
-        document.getElementById(key + "Card").classList.toggle("busy", state);
+        const card = document.getElementById(key + "Card");
+        if (card) card.classList.toggle("busy", state);
       }
-      // Re-enabling hands every button back; the poll then re-disables the
-      // ones that do not apply, so Start is dead while a service is up.
+      const runAllBtn = document.getElementById("runAllBtn");
+      if (runAllBtn) {
+        runAllBtn.textContent = state ? "Starting system…" : "Start everything";
+      }
       if (!state) refreshStatus();
     }
 
@@ -1129,9 +1269,27 @@
           document.getElementById(key + "Stop").disabled = !up;
         }
       }
+      const total = Object.keys(SERVICES).length;
       const count = document.getElementById("count");
-      count.innerHTML = `<b>${live}</b> / ${Object.keys(SERVICES).length} running`;
+      count.innerHTML = `<b>${live}</b> / ${total} running`;
       count.style.borderColor = live ? "#22c98a59" : "";
+
+      // Same rule as each service's own buttons: nothing to start when all
+      // are up, nothing to stop when none are.
+      if (!busy) {
+        const runAllBtn = document.getElementById("runAllBtn");
+        const stopAllBtn = document.getElementById("stopAllBtn");
+        const allUp = live === total;
+        if (runAllBtn) {
+          runAllBtn.disabled = allUp;
+          runAllBtn.textContent = allUp ? "Everything is running" : "Start everything";
+          runAllBtn.title = allUp ? "All services are already running" : "Start MySQL, the frontend and the API";
+        }
+        if (stopAllBtn) {
+          stopAllBtn.disabled = live === 0;
+          stopAllBtn.title = live === 0 ? "Nothing is running" : "Stop every service";
+        }
+      }
     }
 
     async function startOne(key) {
@@ -1194,37 +1352,83 @@
       }
     }
 
-    // MySQL first, then the API, then Angular.
+    async function fixMysql(btn) {
+      if (!api || !api.fixMysql) {
+        show("Fix MySQL needs the updated launcher. Restart the launcher app.", "bad");
+        return;
+      }
+      if (btn) working(btn, true);
+      const cardFix = document.getElementById("mysqlFix");
+      if (cardFix && cardFix !== btn) working(cardFix, true);
+      setBusy(true, ["mysql"]);
+      show("Auto-repairing MySQL (fixing crashed Aria tables, clearing locks and log sequences)…");
+      log("[Auto-Fix] Starting automatic MySQL repair...");
+      try {
+        await persist();
+        const cfg = readConfig().mysql || {};
+        let r = await api.fixMysql({ cwd: cfg.path, command: cfg.command });
+        log("[Auto-Fix] " + r.message);
+        // The safe repair did not help: the redo-log reset can lose the latest
+        // transactions, so it only runs when the person agrees to it.
+        if (!r.ok && r.needsLogReset) {
+          const go = window.confirm(
+            r.message + "\n\nRun the advanced repair now? The current InnoDB logs are kept as a backup (renamed), not deleted."
+          );
+          if (go) {
+            show("Running the advanced MySQL repair…");
+            r = await api.fixMysql({ cwd: cfg.path, command: cfg.command, allowLogReset: true });
+            log("[Auto-Fix] " + r.message);
+          }
+        }
+        show(r.message, r.ok ? "ok" : "bad", !r.ok);
+        refreshStatus();
+      } catch (e) {
+        show("MySQL Fix failed: " + e.message, "bad", true);
+        log("[Auto-Fix Error] " + e.message);
+      } finally {
+        if (btn) working(btn, false);
+        if (cardFix && cardFix !== btn) working(cardFix, false);
+        setBusy(false, ["mysql"]);
+      }
+    }
+
+    // Orchestrated startup: MySQL -> Verify DB -> API -> Verify Health -> Frontend -> Ready
     async function runAll() {
+      if (busy) return;
       const keys = Object.keys(SERVICES);
       const btn = document.getElementById("runAllBtn");
       working(btn, true);
       setBusy(true, keys);
       try {
         await persist();
-        show("Starting everything…");
+        show("Starting system…", "working");
+        log("[STARTUP] Start requested");
 
-        let results;
         if (hasFullBridge) {
-          results = await api.runAll(readConfig());
-        } else {
-          results = [];
-          for (const key of keys) {
-            results.push(await startOne(key));
-            await new Promise(r => setTimeout(r, 4000));
+          const result = await api.runAll(readConfig());
+          if (result && result.ok) {
+            show(result.message || "System Ready", "ok");
+            log("[STARTUP] System Ready");
+          } else {
+            const err = (result && (result.error || result.message)) || "Startup failed. See log.";
+            show(err, "bad", false, true);
+            log("[STARTUP][ERROR] " + err);
           }
+        } else {
+          for (const key of keys) {
+            const res = await startOne(key);
+            log(res.message);
+            await new Promise(r => setTimeout(r, 2000));
+          }
+          show("Services started.", "ok");
         }
-
-        for (const r of results) log(r.message);
-        const failed = results.filter(r => !r.ok);
-        if (failed.length) show(`${failed.length} of ${results.length} did not start. See the log.`, "bad");
-        else show("MySQL, the POS API and the frontend are running.", "ok");
       } catch (e) {
-        show(e.message, "bad");
-        log(e.message);
+        show(e.message, "bad", false, true);
+        log("[STARTUP][ERROR] " + e.message);
       } finally {
         working(btn, false);
         setBusy(false, keys);
+        refreshStatus();
       }
     }
 
@@ -1396,6 +1600,20 @@
       setInterval(refreshStatus, 4000);
       refreshLinks();
       setInterval(refreshLinks, 15000);
+      if (api.onStartupProgress) {
+        api.onStartupProgress(d => {
+          if (d.error) {
+            show(d.message, "bad", false, true);
+          } else if (d.state === "READY") {
+            show(d.message || "System Ready", "ok");
+          } else {
+            show(d.message, "working");
+          }
+        });
+      }
+      if (api.onLog) {
+        api.onLog(msg => log(msg));
+      }
       if (api.onStatus) {
         api.onStatus(d => {
           const line = `${d.name} ${d.running ? "started" : "stopped"}`;
@@ -1410,4 +1628,4 @@
   </script>
 </body>
 
-</html>
+</html>

@@ -54,6 +54,13 @@ After MySQL is down, the launcher closes the XAMPP panel with its Quit button, b
 only when every module in it shows Start - quitting with Apache still up would
 leave Apache running with nothing managing it.
 
+XAMPP 3.3.0's Quit crashes ("Exception EAccessViolation in module
+xampp-control.exe") when it cannot save C:\xampp\xampp-control.ini, which the
+XAMPP installer makes read-only for non-admin users. setup.ps1 grants write
+access to that file. Until it has, or if the panel errors or hangs on the way
+out anyway, the launcher ends the panel process directly instead of showing the
+crash - nothing is lost, since every module is already stopped by then.
+
 ## Closing the window
 If any service is still running, the close button asks first:
 
