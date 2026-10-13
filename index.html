@@ -377,6 +377,28 @@
       }
     }
 
+    /* Start button while its service is coming up: label stays readable,
+       with a small spinner in front of it. */
+    button.processing {
+      opacity: 1;
+      cursor: progress;
+      background: linear-gradient(135deg, #3b82f6, #2563eb);
+      box-shadow: 0 6px 18px #3b82f63d
+    }
+
+    button.processing::before {
+      content: "";
+      display: inline-block;
+      width: 11px;
+      height: 11px;
+      margin-right: 7px;
+      vertical-align: -1px;
+      border: 2px solid #ffffff59;
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .7s linear infinite
+    }
+
     /* ---------- top actions ---------- */
     .toprow {
       display: flex;
@@ -1097,6 +1119,41 @@
     let busy = false;
     const wasUp = {};
 
+    // Services whose start was accepted but whose port is not open yet (the
+    // Angular build takes a while). Their Start button stays "Processing…"
+    // until the status poll sees the port, or until this deadline passes.
+    const pending = {};
+    const PENDING_MAX_MS = 3 * 60 * 1000;
+    function markPending(key) { pending[key] = Date.now() + PENDING_MAX_MS; paintStart(key, false); }
+    function clearPending(key) { delete pending[key]; }
+    function isPending(key) {
+      if (!pending[key]) return false;
+      if (Date.now() > pending[key]) { delete pending[key]; return false; }
+      return true;
+    }
+
+    // One place that decides what a Start button and its state cell show.
+    function paintStart(key, up) {
+      const btn = document.getElementById(key + "Start");
+      const cell = document.getElementById(key + "State");
+      if (!btn) return;
+      if (up) {
+        clearPending(key);
+        btn.classList.remove("processing");
+        btn.textContent = "Running";
+        btn.disabled = true;
+      } else if (isPending(key)) {
+        btn.classList.add("processing");
+        btn.textContent = "Processing…";
+        btn.disabled = true;
+        if (cell) cell.innerHTML = `<span class="dot working"></span>starting`;
+      } else {
+        btn.classList.remove("processing");
+        btn.textContent = "Start";
+        btn.disabled = busy;
+      }
+    }
+
     function show(text, state = "", canRetry = false) {
       const el = document.getElementById("status");
       if (!el) return;
@@ -1209,7 +1266,7 @@
         wasUp[key] = up;
 
         if (!busy) {
-          document.getElementById(key + "Start").disabled = up;
+          paintStart(key, up);
           document.getElementById(key + "Stop").disabled = !up;
         }
       }
@@ -1256,20 +1313,23 @@
       return { ok: false, message: `${label}: no bridge - main.js must set webPreferences.preload to preload.js.` };
     }
 
+    // Button text: Start -> Processing… (spinner) -> Running once the port is
+    // open, or back to Start on failure.
     async function run(key) {
-      const btn = document.getElementById(key + "Start");
-      working(btn, true);
+      markPending(key);
       setBusy(true, [key]);
+      let ok = false;
       try {
         await persist();
         const r = await startOne(key);
+        ok = !!r.ok;
         show(r.message, r.ok ? "ok" : "bad");
         log(r.message);
       } catch (e) {
         show(`${SERVICES[key].label}: ${e.message}`, "bad");
         log(`${SERVICES[key].label}: ${e.message}`);
       } finally {
-        working(btn, false);
+        if (!ok) clearPending(key);
         setBusy(false, [key]);
       }
     }
@@ -1281,6 +1341,7 @@
         return;
       }
       const btn = document.getElementById(key + "Stop");
+      clearPending(key);
       working(btn, true);
       setBusy(true, [key]);
       try {
@@ -1342,6 +1403,7 @@
       const btn = document.getElementById("runAllBtn");
       working(btn, true);
       setBusy(true, keys);
+      for (const key of keys) if (!wasUp[key]) markPending(key);
       try {
         await persist();
         show("Starting system…", "working");
@@ -1356,6 +1418,9 @@
             const err = (result && (result.error || result.message)) || "Startup failed. See log.";
             show(err, "bad", true);
             log("[STARTUP][ERROR] " + err);
+            // The failed step and everything after it never started.
+            const from = keys.indexOf(result && result.step);
+            for (const key of keys.slice(from < 0 ? 0 : from)) clearPending(key);
           }
         } else {
           for (const key of keys) {
@@ -1385,6 +1450,7 @@
       const btn = document.getElementById("stopAllBtn");
       working(btn, true);
       setBusy(true, keys);
+      for (const key of keys) clearPending(key);
       try {
         show("Stopping everything…");
         const results = await api.stopAll(readConfig());
