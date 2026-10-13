@@ -550,6 +550,8 @@
       min-width: 96px
     }
 
+    .note { font-size: 12px; color: #8b93a7; margin-left: 10px; }
+    .note.warn { color: #ff6b6b; font-weight: 700; }
     .state {
       margin-left: auto;
       font-size: 12px;
@@ -1032,7 +1034,7 @@
           <div class="icon">⚙️</div>
           <div>
             <div class="title">POS API</div>
-            <div class="meta">Advanced-Pos-System-BE · own terminal</div>
+            <div class="meta">Advanced-Pos-System-BE · PM2 service · restarts by itself if it crashes</div>
           </div>
           <div class="chip">:8000</div>
         </div>
@@ -1041,12 +1043,13 @@
             <input id="backendPath" placeholder="Advanced-Pos-System-BE folder">
             <button class="ghost" onclick="browse('backend')">Browse</button>
           </div>
-          <input class="cmd" id="backendCmd" placeholder="Terminal command">
+          <input class="cmd" id="backendCmd" placeholder="Terminal command" style="display:none">
         </div>
         <div class="btnrow">
           <button class="go" id="backendStart" onclick="run('backend')">Start</button>
           <button class="danger" id="backendStop" onclick="stopSvc('backend')">Stop</button>
           <span class="state" id="backendState"><span class="dot"></span>checking</span>
+          <span class="note" id="backendNote"></span>
         </div>
       </div>
     </div>
@@ -1105,16 +1108,13 @@
 
   <script>
     const SERVICES = {
-      mysql: { label: "MySQL", legacy: "startMysql" },
-      backend: { label: "POS API", legacy: "runBackend" },
-      admin: { label: "POS Frontend", legacy: "runAdmin" }
+      mysql: { label: "MySQL" },
+      backend: { label: "POS API" },
+      admin: { label: "POS Frontend" }
     };
 
     const api = window.launcher || null;
-    // The old preload only had startMysql / runBackend / runAdmin and ignored
-    // the folder and command. Detect it so the buttons still do something.
     const hasFullBridge = !!(api && api.runService && api.runAll);
-    const hasLegacyBridge = !!(api && api.runBackend && !hasFullBridge);
 
     let busy = false;
     const wasUp = {};
@@ -1255,6 +1255,10 @@
         const up = !!state[key];
         if (up) live++;
         cell.innerHTML = `<span class="dot ${up ? "ok" : "bad"}"></span>${up ? "running" : "stopped"}`;
+        // The API alive under PM2 but not listening yet: it is waiting for MySQL.
+        if (key === "backend" && !up && state.backendPm2 && state.backendPm2.online) {
+          cell.innerHTML = `<span class="dot working"></span>waiting for MySQL`;
+        }
 
         const card = document.getElementById(key + "Card");
         card.classList.toggle("up", up);
@@ -1270,6 +1274,16 @@
           document.getElementById(key + "Stop").disabled = !up;
         }
       }
+      // PM2's restart counter: a crash PM2 recovered from must still be seen.
+      const note = document.getElementById("backendNote");
+      const pm = state.backendPm2;
+      if (note) {
+        if (pm === null) { note.textContent = "PM2 not installed"; note.className = "note warn"; }
+        else if (!pm || !pm.known) { note.textContent = "not yet started under PM2"; note.className = "note"; }
+        else if (pm.restarts > 0) { note.textContent = `auto-restarted ${pm.restarts}× since start — see Advanced-Pos-System-BE\\logs`; note.className = "note warn"; }
+        else { note.textContent = "PM2 · auto-restart on"; note.className = "note"; }
+      }
+
       const total = Object.keys(SERVICES).length;
       const count = document.getElementById("count");
       count.innerHTML = `<b>${live}</b> / ${total} running`;
@@ -1295,22 +1309,15 @@
 
     async function startOne(key) {
       const cfg = readConfig()[key];
-      const { label, legacy } = SERVICES[key];
+      const { label } = SERVICES[key];
 
-      if (hasFullBridge) {
-        if (!cfg.path || !cfg.command) {
-          return { ok: false, message: `${label}: fill in the folder and the command first.` };
-        }
-        return api.runService({ key, name: label, cwd: cfg.path, command: cfg.command });
+      if (!hasFullBridge) {
+        return { ok: false, message: `${label}: no bridge - main.js must set webPreferences.preload to preload.js.` };
       }
-
-      if (hasLegacyBridge && api[legacy]) {
-        const r = await api[legacy]();
-        log(`${label}: old bridge in use — the folder and command boxes are ignored.`);
-        return { ok: r && r.ok, message: (r && r.message) || `${label} started.` };
+      if (!cfg.path || (!cfg.command && key !== "backend")) {
+        return { ok: false, message: `${label}: fill in the folder and the command first.` };
       }
-
-      return { ok: false, message: `${label}: no bridge - main.js must set webPreferences.preload to preload.js.` };
+      return api.runService({ key, name: label, cwd: cfg.path, command: cfg.command });
     }
 
     // Button text: Start -> Processing… (spinner) -> Running once the port is
@@ -1396,7 +1403,7 @@
       }
     }
 
-    // Start everything: MySQL -> open the frontend and API terminals -> done
+    // Start everything: MySQL, the frontend terminal and the PM2 API, all at once.
     async function runAll() {
       if (busy) return;
       const keys = Object.keys(SERVICES);
@@ -1409,26 +1416,16 @@
         show("Starting system…", "working");
         log("[STARTUP] Start requested");
 
-        if (hasFullBridge) {
-          const result = await api.runAll(readConfig());
-          if (result && result.ok) {
-            show(result.message || "System Ready", "ok");
-            log("[STARTUP] System Ready");
-          } else {
-            const err = (result && (result.error || result.message)) || "Startup failed. See log.";
-            show(err, "bad", true);
-            log("[STARTUP][ERROR] " + err);
-            // The failed step and everything after it never started.
-            const from = keys.indexOf(result && result.step);
-            for (const key of keys.slice(from < 0 ? 0 : from)) clearPending(key);
-          }
+        const result = await api.runAll(readConfig());
+        if (result && result.ok) {
+          show(result.message || "System Ready", "ok");
+          log("[STARTUP] System Ready");
         } else {
-          for (const key of keys) {
-            const res = await startOne(key);
-            log(res.message);
-            await new Promise(r => setTimeout(r, 2000));
-          }
-          show("Services started.", "ok");
+          const err = (result && (result.error || result.message)) || "Startup failed. See log.";
+          show(err, "bad", true);
+          log("[STARTUP][ERROR] " + err);
+          // Everything starts together, so only the failed one is not coming.
+          if (result && result.step) clearPending(result.step);
         }
       } catch (e) {
         show(e.message, "bad", true);
@@ -1587,9 +1584,6 @@
         return;
       }
       if (api.bridgeVersion >= 2) log("Bridge v" + api.bridgeVersion + " connected.");
-      if (hasLegacyBridge) {
-        show("Old bridge detected. Folder and command boxes are ignored until preload.js is updated.", "bad");
-      }
       if (hasFullBridge && api.getConfig) {
         try { fillConfig(await api.getConfig()); } catch (e) { log("Using defaults: " + e.message); }
         for (const key of Object.keys(SERVICES)) {
@@ -1637,4 +1631,4 @@
   </script>
 </body>
 
-</html>
+</html>

@@ -12,14 +12,8 @@ const TRAY_ICON = path.join(__dirname, "tray.png");
 // POS-Desktop sits next to Advanced-Pos-System-BE and Advanced-Pos-System-FE in the repo, so the
 // defaults follow the folder rather than one machine's absolute paths.
 const REPO = path.join(__dirname, "..");
-
-function resolveBackendPath() {
-  return path.join(REPO, "Advanced-Pos-System-BE");
-}
-
-function resolveFrontendPath() {
-  return path.join(REPO, "Advanced-Pos-System-FE");
-}
+const BACKEND_PATH = path.join(REPO, "Advanced-Pos-System-BE");
+const FRONTEND_PATH = path.join(REPO, "Advanced-Pos-System-FE");
 
 const DEFAULT_CONFIG = {
   mysql: {
@@ -27,40 +21,22 @@ const DEFAULT_CONFIG = {
     command: "mysqld.exe --defaults-file=C:\\xampp\\mysql\\bin\\my.ini --standalone"
   },
   backend: {
-    path: resolveBackendPath(),
-    command: "npm run dev"
+    path: BACKEND_PATH,
+    // Managed by PM2 (ecosystem.config.js); no terminal command is needed.
+    command: "pm2 start ecosystem.config.js"
   },
   admin: {
-    path: resolveFrontendPath(),
+    path: FRONTEND_PATH,
     command: "npm start"
   }
 };
 
-const StartupState = {
-  IDLE: "IDLE",
-  STARTING_SYSTEM: "STARTING_SYSTEM",
-  CHECKING_MYSQL: "CHECKING_MYSQL",
-  STARTING_MYSQL: "STARTING_MYSQL",
-  WAITING_FOR_MYSQL: "WAITING_FOR_MYSQL",
-  CONNECTING_DATABASE: "CONNECTING_DATABASE",
-  CHECKING_API: "CHECKING_API",
-  STARTING_API: "STARTING_API",
-  WAITING_FOR_API: "WAITING_FOR_API",
-  STARTING_FRONTEND: "STARTING_FRONTEND",
-  WAITING_FOR_FRONTEND: "WAITING_FOR_FRONTEND",
-  READY: "READY",
-  ERROR: "ERROR"
-};
-
-// Global startup lock to prevent duplicate runs and race conditions
-let startupLock = false;
-let currentStartupState = StartupState.IDLE;
-
 // hidden = background process, no console window, like the XAMPP Start button.
 // terminal = its own cmd window so you can watch the logs.
+// pm2 = managed by PM2 (started/stopped through the pm2 CLI).
 const SERVICES = {
   mysql: { name: "MySQL", mode: "hidden", port: 3306 },
-  backend: { name: "POS API", mode: "terminal", port: 8000 },
+  backend: { name: "POS API", mode: "pm2", port: 8000 },
   admin: { name: "POS Frontend", mode: "terminal", port: 8002 }
 };
 
@@ -72,6 +48,14 @@ const RUN_ORDER = ["mysql", "backend", "admin"];
 // that waits on mysqld, so Start knows the moment mysqld quits.
 const started = {};
 const startedAlive = (key) => !!(started[key] && started[key].exitCode === null && started[key].signalCode === null);
+
+// Start everything / Fix MySQL / single Start buttons never run at the same time.
+let startupLock = false;
+let mysqlBusy = false;
+
+// Set once this XAMPP's mysqld was started or seen running by the launcher,
+// so a Windows shutdown stops it cleanly.
+let ownMysqlVerified = false;
 
 let win = null;
 let shuttingDown = false;
@@ -127,13 +111,9 @@ function readConfig() {
     for (const key of Object.keys(DEFAULT_CONFIG)) {
       merged[key] = Object.assign({}, DEFAULT_CONFIG[key], saved[key] || {});
     }
-    // Strict enforcement: Ensure backend and admin paths always target Advanced POS System
-    if (merged.backend && (!merged.backend.path || !fs.existsSync(merged.backend.path) || merged.backend.path.includes("Pos-Backend"))) {
-      merged.backend.path = resolveBackendPath();
-    }
-    if (merged.admin && (!merged.admin.path || !fs.existsSync(merged.admin.path) || merged.admin.path.includes("Pos-Frontend"))) {
-      merged.admin.path = resolveFrontendPath();
-    }
+    // A saved folder that no longer exists falls back to the repo folder.
+    if (!merged.backend.path || !fs.existsSync(merged.backend.path)) merged.backend.path = BACKEND_PATH;
+    if (!merged.admin.path || !fs.existsSync(merged.admin.path)) merged.admin.path = FRONTEND_PATH;
     return merged;
   } catch {
     return DEFAULT_CONFIG;
@@ -165,8 +145,8 @@ function sendLog(line) {
   if (win && !win.isDestroyed()) win.webContents.send("launcher:log", line);
 }
 
+// The page shows `message`; `error` paints it red, state "READY" green.
 function sendStartupProgress(data) {
-  currentStartupState = data.state || currentStartupState;
   if (win && !win.isDestroyed()) win.webContents.send("launcher:startup-progress", data);
 }
 
@@ -255,21 +235,13 @@ function processTable() {
   });
 }
 
-// Find the cmd.exe that owns the console window, so the whole service dies
-// with its terminal. Killing anything below it leaves the window sitting
-// there, and its title belongs to conhost, not to cmd, so taskkill
-// /FI WINDOWTITLE never matches it either.
-//
-// The walk has to pass through node.exe as well as cmd.exe, because an npm
-// script stacks both. "npm run dev" on the API is:
-//
-//   cmd /k -> node (npm) -> cmd (npm.cmd) -> node (tsx watch) -> node (server)
-//
-// Only that last node holds port 8000. Stopping at the first non-cmd parent
-// would kill it and leave tsx watch alive - which just restarts the server -
-// plus the window. So walk up through both, and remember the outermost
-// cmd.exe seen; that one is the window. If there is no cmd.exe above at all,
-// fall back to the listening pid itself.
+// Find the cmd.exe that owns the console window of a terminal service that
+// the launcher did not start itself (e.g. an "npm start" window from a
+// previous launcher run), so the whole service dies with its terminal.
+// An npm script stacks cmd.exe and node.exe several levels deep
+// (cmd /k -> node (npm) -> cmd (npm.cmd) -> node (ng serve)), and only the
+// innermost node holds the port - so walk up through both and remember the
+// outermost cmd.exe seen; that one is the window.
 function consoleRootOf(pid, table) {
   let target = String(pid);
   let root = target;
@@ -293,6 +265,12 @@ function run(exe, args, timeout = 20000) {
   });
 }
 
+function runOut(exe, args, timeout = 20000) {
+  return new Promise((resolve) => {
+    execFile(exe, args, { windowsHide: true, timeout }, (err, stdout) => resolve(err ? null : String(stdout)));
+  });
+}
+
 // mysqld holds the data files, so ask it to shut down before killing it.
 async function mysqlShutdown(binPath) {
   const exe = binPath && path.join(binPath, "mysqladmin.exe");
@@ -300,17 +278,22 @@ async function mysqlShutdown(binPath) {
   return run(exe, ["-u", "root", "--protocol=tcp", "-h", "127.0.0.1", "shutdown"], 20000);
 }
 
-function runOut(exe, args, timeout = 20000) {
-  return new Promise((resolve) => {
-    execFile(exe, args, { windowsHide: true, timeout }, (err, stdout) => resolve(err ? null : String(stdout)));
-  });
-}
-
 async function stop(key, entry) {
   const svc = SERVICES[key] || { name: key };
   const { name, port } = svc;
 
   if (!port) return { ok: false, key, message: `${name}: no port configured, stop it by hand.` };
+
+  // The API under PM2 is stopped through PM2 whether or not it is listening
+  // yet (it may still be waiting for MySQL) - otherwise PM2 restarts it.
+  if (key === "backend" && (await stopBackendViaPm2(entry && entry.path))) {
+    const down = await waitForPortClosed(port, 15000);
+    sendStatus({ key, name, running: !down });
+    return down
+      ? { ok: true, key, message: `${name} stopped (PM2 will not restart it until you press Start).` }
+      : { ok: false, key, message: `${name}: PM2 stopped it but port ${port} is still open.` };
+  }
+
   if (!(await portOpen(port))) {
     sendStatus({ key, name, running: false });
     return { ok: true, key, message: `${name} was not running.` };
@@ -351,32 +334,10 @@ async function stop(key, entry) {
     : { ok: false, key, message: `${name}: port ${port} is still open - stop it from Task Manager.` };
 }
 
-// A hidden service has no window, and mysqld writes its fatal errors to stderr
-// rather than to mysql_error.log - "Failed to initialize multi master
-// structures / Aborting" never reaches the log file. So capture the output to
-// a file per service and quote it back when a start fails.
-function serviceLog(key) {
-  return path.join(app.getPath("userData"), `${key}-output.log`);
-}
-
-function lastLoggedError(key, cwd) {
-  const pick = (text) => {
-    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-    const bad = lines.reverse().find((l) =>
-      l.includes("[ERROR]") || l.includes("Aborting") || l.includes("is not recognized"));
-    return bad || "";
-  };
-
+/** Last [ERROR] / Aborting line of data\mysql_error.log, for the error banner. */
+function lastMysqlError(binPath) {
   try {
-    const file = serviceLog(key);
-    if (fs.existsSync(file)) {
-      const hit = pick(fs.readFileSync(file, "utf8").slice(-16384));
-      if (hit) return hit.slice(0, 180);
-    }
-  } catch { /* fall through to the error log */ }
-
-  try {
-    const log = path.join(cwd, "..", "data", "mysql_error.log");
+    const log = path.join(binPath, "..", "data", "mysql_error.log");
     if (!fs.existsSync(log)) return "";
     const { size } = fs.statSync(log);
     const start = Math.max(0, size - 65536);
@@ -384,7 +345,9 @@ function lastLoggedError(key, cwd) {
     const buf = Buffer.alloc(size - start);
     fs.readSync(fd, buf, 0, buf.length, start);
     fs.closeSync(fd);
-    return pick(buf.toString("utf8")).slice(0, 180);
+    const lines = buf.toString("utf8").split("\n").map((l) => l.trim()).filter(Boolean);
+    const bad = lines.reverse().find((l) => l.includes("[ERROR]") || l.includes("Aborting"));
+    return (bad || "").slice(0, 180);
   } catch {
     return "";
   }
@@ -394,11 +357,14 @@ async function launchRaw(key, entry, checkExisting = true) {
   const svc = SERVICES[key] || { name: key, mode: "terminal" };
   const { name, mode } = svc;
   const cwd = entry && entry.path;
-  const command = entry && entry.command;
+  let command = entry && entry.command;
 
   if (!cwd || !command) {
     return { ok: false, key, message: `${name}: folder or command is empty.` };
   }
+  // Never run mysqld with --console: on MariaDB 10.4/Windows it then writes
+  // nothing to data\mysql_error.log, so a crash would leave no record at all.
+  if (key === "mysql") command = command.replace(/\s+--console\b/g, "");
   if (!fs.existsSync(cwd)) {
     return { ok: false, key, message: `${name}: folder not found - ${cwd}` };
   }
@@ -425,20 +391,13 @@ async function launchRaw(key, entry, checkExisting = true) {
     }
     env.PATH = cwd + ";" + (process.env.PATH || "");
 
-    let outFd = null;
-    if (mode === "hidden") {
-      try { outFd = fs.openSync(serviceLog(key), "w"); } catch { outFd = null; }
-    }
-
     const child = spawn("cmd.exe", args, {
       cwd,
       env,
       detached: true,
       windowsHide: mode === "hidden",
-      stdio: outFd === null ? "ignore" : ["ignore", outFd, outFd]
+      stdio: "ignore"
     });
-
-    if (outFd !== null) { try { fs.closeSync(outFd); } catch { /* already closed */ } }
 
     child.on("error", (err) => {
       sendStatus({ key, name, running: false, error: err.message });
@@ -453,87 +412,112 @@ async function launchRaw(key, entry, checkExisting = true) {
   }
 }
 
-async function verifyDatabaseConnection(binPath, timeoutMs = 3000) {
-  const mysqlAdminExe = binPath && path.join(binPath, "mysqladmin.exe");
-  const mysqlExe = binPath && path.join(binPath, "mysql.exe");
+// ════════════════════════════════════════════════════════════════════════
+// POS API as a PM2 service
+//
+// The API runs under PM2 (its compiled build, dist/server.js): PM2 starts
+// it again by itself if it crashes and keeps its logs in
+// Advanced-Pos-System-BE/logs. Nothing starts at login - the first start is
+// always a click here. Start = "pm2 start", Stop = "pm2 stop" (a stopped app
+// is NOT restarted by PM2). The launcher shows PM2's restart counter in red
+// so a crash that PM2 papered over is still noticed.
+// ════════════════════════════════════════════════════════════════════════
+const PM2_APP = "pos-api";
 
-  // Attempt 1: Ping via mysqladmin if available
-  if (mysqlAdminExe && fs.existsSync(mysqlAdminExe)) {
-    const adminPing = await new Promise((resolve) => {
-      execFile(
-        mysqlAdminExe,
-        ["-u", "root", "-h", "127.0.0.1", "--protocol=tcp", "ping"],
-        { windowsHide: true, timeout: timeoutMs },
-        (err, stdout) => {
-          if (!err && String(stdout).toLowerCase().includes("alive")) {
-            resolve({ ok: true });
-          } else {
-            resolve({ ok: false, error: err ? err.message : String(stdout).trim() });
-          }
-        }
-      );
-    });
+function pm2Cmd() {
+  // Installed with "npm i -g pm2"; the full path works even when the
+  // launcher's own PATH does not include the global npm folder.
+  const global = path.join(process.env.APPDATA || "", "npm", "pm2.cmd");
+  return fs.existsSync(global) ? global : "pm2";
+}
 
-    // mysqladmin is present: its answer is final. No raw-socket fallback - an
-    // open-and-drop connection is exactly what MySQL must not be flooded with.
-    if (!adminPing.ok) return adminPing;
-    if (adminPing.ok) {
-      if (mysqlExe && fs.existsSync(mysqlExe)) {
-        const queryCheck = await new Promise((resolve) => {
-          execFile(
-            mysqlExe,
-            ["-u", "root", "-h", "127.0.0.1", "--protocol=tcp", "-e", "SELECT 1;"],
-            { windowsHide: true, timeout: timeoutMs },
-            (err) => resolve(!err)
-          );
-        });
-        return queryCheck ? { ok: true } : { ok: false, error: "MySQL answers, but a test query failed." };
-      }
-      return { ok: true };
-    }
+function pm2(args, cwd, timeout = 60000) {
+  return new Promise((resolve) => {
+    execFile("cmd.exe", ["/c", pm2Cmd(), ...args], { cwd: cwd || undefined, windowsHide: true, timeout },
+      (err, stdout, stderr) => resolve({ ok: !err, out: String(stdout || "") + String(stderr || "") }));
+  });
+}
+
+/** PM2's view of the API: null = PM2 not available; known=false = never started under PM2. */
+async function pm2Status(cwd) {
+  const r = await pm2(["jlist"], cwd, 25000);
+  if (!r.ok) return null;
+  try {
+    const list = JSON.parse(r.out.slice(r.out.indexOf("[")));
+    const app = list.find((a) => a.name === PM2_APP);
+    if (!app) return { known: false };
+    const e = app.pm2_env || {};
+    return {
+      known: true,
+      online: e.status === "online",
+      status: e.status,
+      restarts: Number(e.restart_time) || 0,
+      pid: app.pid || null,
+      since: e.pm_uptime || null
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Starts the API under PM2. An API that PM2 already reports online is left
+ * alone (it is serving, or waiting for MySQL by itself - the API never gives
+ * up on the database in production), so this costs one PM2 call.
+ */
+async function startBackend(backendCfg) {
+  const name = "POS API";
+  const cwd = backendCfg && backendCfg.path;
+  if (!cwd || !fs.existsSync(cwd)) return { ok: false, key: "backend", message: `${name}: folder not found - ${cwd}` };
+  if (!fs.existsSync(path.join(cwd, "ecosystem.config.js"))) {
+    return { ok: false, key: "backend", message: `${name}: ecosystem.config.js is missing in ${cwd}.` };
   }
 
-  // Attempt 2: Connect socket and verify greeting packet
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    let settled = false;
+  const st = await pm2Status(cwd);
+  if (st === null) {
+    return { ok: false, key: "backend", message: `${name}: PM2 is not installed or not answering. Run "npm i -g pm2" once, then press Start again.` };
+  }
+  if (st.online) {
+    sendStatus({ key: "backend", name, running: true });
+    return { ok: true, key: "backend", alreadyRunning: true, message: `${name} is running under PM2.` };
+  }
 
-    const timer = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        socket.destroy();
-        resolve({ ok: false, error: "Database connection timed out" });
-      }
-    }, timeoutMs);
+  // An API started some other way (e.g. an old "npm run dev" window) holds
+  // port 8000: stop it so PM2 owns the port from now on.
+  if (await portOpen(8000, 600)) {
+    sendLog("[API] Port 8000 is used by an API that PM2 does not manage - stopping it so PM2 can take over.");
+    await stop("backend", backendCfg);
+    await waitForPortClosed(8000, 15000);
+  }
 
-    socket.connect(3306, "127.0.0.1", () => {
-      // socket connected, waiting for greeting packet
+  // First run on this PC: the compiled build does not exist yet.
+  if (!fs.existsSync(path.join(cwd, "dist", "server.js"))) {
+    sendLog("[API] No build found - running \"npm run build\" (first time only, about a minute)...");
+    sendStartupProgress({ message: "Building the API (first time only)..." });
+    const built = await new Promise((resolve) => {
+      execFile("cmd.exe", ["/c", "npm", "run", "build"], { cwd, windowsHide: true, timeout: 300000 }, (err) => resolve(!err));
     });
+    if (!built) return { ok: false, key: "backend", message: `${name}: "npm run build" failed. Open a terminal in ${cwd}, run it, and read the error.` };
+  }
 
-    socket.on("data", (data) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      // Packet index 4: 0x0A (10) indicates valid MySQL greeting
-      if (data && data.length > 4 && data[4] === 0x0a) {
-        resolve({ ok: true });
-      } else if (data && data.length > 4 && data[4] === 0xff) {
-        const errText = data.slice(7).toString("utf8").replace(/[^\x20-\x7E]/g, "");
-        resolve({ ok: false, error: errText || "MySQL rejected handshake" });
-      } else {
-        resolve({ ok: true });
-      }
-    });
+  sendLog(st.known ? "[API] Starting under PM2..." : "[API] Registering with PM2 and starting...");
+  const r = st.known
+    ? await pm2(["restart", PM2_APP, "--update-env"], cwd)
+    : await pm2(["start", "ecosystem.config.js"], cwd);
+  if (!r.ok) return { ok: false, key: "backend", message: `${name}: PM2 could not start it.\n${r.out.trim().slice(-400)}` };
+  // A manual start begins a fresh count: the red note then means "crashed
+  // since you started it". Not awaited - nothing depends on it.
+  pm2(["reset", PM2_APP], cwd, 20000);
+  sendStatus({ key: "backend", name, running: true });
+  return { ok: true, key: "backend", message: `${name} started under PM2 (restarts by itself if it crashes).` };
+}
 
-    socket.on("error", (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve({ ok: false, error: err.message });
-    });
-  });
+/** Stops the API through PM2 so PM2 does not start it again. True when PM2 handled it. */
+async function stopBackendViaPm2(cwd) {
+  const st = await pm2Status(cwd);
+  if (!st || !st.known || st.status === "stopped") return false;
+  const r = await pm2(["stop", PM2_APP], cwd, 30000);
+  return r.ok;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -551,17 +535,10 @@ const MYSQL_START_TIMEOUT_MS = 60000;
 // after it, the button returns "starting" and the status dot goes green by itself.
 const MYSQL_BUTTON_WAIT_MS = 5000;
 
-// Fix MySQL and the Start buttons must not run at the same time.
-let mysqlBusy = false;
-
-// Set once this XAMPP's mysqld was started or seen running by the launcher,
-// so a Windows shutdown stops it cleanly.
-let ownMysqlVerified = false;
-
-/** MySQL answers mysqladmin ping on 127.0.0.1:3306 (one process, ~100 ms). */
+/** MySQL answers mysqladmin ping on 127.0.0.1:3306 (one process, ~40 ms). */
 async function mysqlAlive(binPath, timeoutMs = 3000) {
   const exe = binPath && path.join(binPath, "mysqladmin.exe");
-  if (!exe || !fs.existsSync(exe)) return (await verifyDatabaseConnection(binPath, timeoutMs)).ok;
+  if (!exe || !fs.existsSync(exe)) return portOpen(3306);
   const out = await runOut(exe, ["-u", "root", "-h", "127.0.0.1", "--protocol=tcp", "ping"], timeoutMs);
   return !!out && out.toLowerCase().includes("alive");
 }
@@ -602,7 +579,6 @@ async function waitForOwnMysqldExit(binPath, timeoutMs) {
  */
 async function startMysql(mysqlCfg, quick = false) {
   const binPath = mysqlCfg.path;
-  sendStartupProgress({ state: StartupState.CHECKING_MYSQL, message: "Checking MySQL...", step: 1, total: 5 });
 
   if (await mysqlAlive(binPath)) {
     sendLog("[MySQL] Already running.");
@@ -619,11 +595,9 @@ async function startMysql(mysqlCfg, quick = false) {
   }
 
   sendLog("[MySQL] Starting...");
-  sendStartupProgress({ state: StartupState.STARTING_MYSQL, message: "Starting database...", step: 1, total: 5 });
   const launched = await launchRaw("mysql", mysqlCfg, false);
   if (!launched.ok) return { ok: false, error: launched.message };
 
-  sendStartupProgress({ state: StartupState.WAITING_FOR_MYSQL, message: "Waiting for MySQL...", step: 2, total: 5 });
   const deadline = Date.now() + (quick ? MYSQL_BUTTON_WAIT_MS : MYSQL_START_TIMEOUT_MS);
   while (Date.now() < deadline) {
     if (await mysqlAlive(binPath, 1500)) {
@@ -641,7 +615,7 @@ async function startMysql(mysqlCfg, quick = false) {
     ownMysqlVerified = true;
     return { ok: true, starting: true };
   }
-  const reason = lastLoggedError("mysql", binPath);
+  const reason = lastMysqlError(binPath);
   return {
     ok: false,
     error: `Unable to start the database.\nMySQL is not responding on 127.0.0.1:3306.\n${reason ? "Log: " + reason + "\n" : ""}Check the XAMPP MySQL log, then press Start again.`
@@ -756,9 +730,11 @@ async function repairSystemTablesOnline(binPath) {
 }
 
 /**
- * Start everything: MySQL (wait until it answers) -> open the frontend and
- * API terminals -> done. The terminals are not waited for; their status dots
- * turn green by themselves when their ports open.
+ * Start everything, all at once: mysqld, the frontend terminal and the API
+ * under PM2 are launched together and the call returns as soon as MySQL
+ * answers and the other two are launched. The API waits for MySQL by itself,
+ * the frontend compiles in its own window; their dots turn green when their
+ * ports open.
  */
 async function orchestratedStartup(cfg) {
   if (startupLock || mysqlBusy) {
@@ -770,36 +746,31 @@ async function orchestratedStartup(cfg) {
   const config = cfg || readConfig();
   const fail = (step, errMsg) => {
     sendLog(`[STARTUP][ERROR] ${errMsg}`);
-    sendStartupProgress({ state: StartupState.ERROR, message: errMsg, error: true, canRetry: true, step });
+    sendStartupProgress({ message: errMsg, error: true, canRetry: true, step });
     return { ok: false, error: errMsg, step };
   };
 
   try {
     sendLog("[STARTUP] Start requested");
-    sendStartupProgress({ state: StartupState.STARTING_SYSTEM, message: "Starting system...", step: 1, total: 5 });
+    sendStartupProgress({ message: "Starting MySQL, the frontend and the API..." });
 
-    // ── 1. MySQL ───────────────────────────────────────────────────────────
-    const mysqlCfg = config.mysql || DEFAULT_CONFIG.mysql;
-    const mysql = await startMysql(mysqlCfg);
+    const [mysql, admin, backend] = await Promise.all([
+      startMysql(config.mysql || DEFAULT_CONFIG.mysql),
+      launchRaw("admin", config.admin || DEFAULT_CONFIG.admin, true),
+      startBackend(config.backend || DEFAULT_CONFIG.backend)
+    ]);
+
     if (!mysql.ok) return fail("mysql", mysql.error);
-    sendStatus({ key: "mysql", name: "MySQL", running: true });
-    sendLog("[STARTUP] Database connected successfully");
-    sendStartupProgress({ state: StartupState.CONNECTING_DATABASE, message: "Database connected successfully.", step: 2, total: 5 });
+    sendLog("[STARTUP] MySQL is ready");
+    sendLog(`[STARTUP] ${admin.message}`);
+    if (!admin.ok) return fail("admin", admin.message);
+    sendLog(`[STARTUP] ${backend.message}`);
+    if (!backend.ok) return fail("backend", backend.message);
 
-    // ── 2. Open both terminals ────────────────────────────────────────────
-    sendStartupProgress({ state: StartupState.STARTING_API, message: "Opening the frontend and API terminals...", step: 3, total: 5 });
-    const results = [{ key: "mysql", ok: true, message: "MySQL is ready" }];
-    for (const key of ["admin", "backend"]) {
-      const r = await launchRaw(key, config[key] || DEFAULT_CONFIG[key], true);
-      sendLog(`[STARTUP] ${r.message}`);
-      if (!r.ok) return fail(key, r.message);
-      results.push({ key, ok: true, message: r.message });
-    }
-
-    const message = "Terminals opened. Each dot turns green when its service is up.";
+    const message = "MySQL ready; frontend terminal opened; API running under PM2. Each dot turns green when its service is up.";
     sendLog(`[STARTUP] ${message}`);
-    sendStartupProgress({ state: StartupState.READY, message, step: 5, total: 5 });
-    return { ok: true, message, results };
+    sendStartupProgress({ state: "READY", message });
+    return { ok: true, message };
   } catch (err) {
     return fail("startup", `Startup failed: ${err.message}`);
   } finally {
@@ -935,18 +906,19 @@ app.whenReady().then(() => {
       return { ok: false, message: "Startup is already in progress. Please wait." };
     }
 
-    const key = svc.key;
-    const config = readConfig();
-
-    if (key === "mysql") {
+    if (svc.key === "mysql") {
       const result = await startMysql({ path: svc.cwd, command: svc.command }, true);
       return result.ok
         ? { ok: true, key: "mysql", message: result.starting ? "MySQL started - the dot turns green as soon as it answers." : "MySQL is running on port 3306." }
         : { ok: false, key: "mysql", message: result.error };
     }
 
+    if (svc.key === "backend") {
+      return startBackend({ path: svc.cwd });
+    }
+
     // Terminal services: open the window, run the command, done.
-    return launchRaw(key, { path: svc.cwd, command: svc.command }, true);
+    return launchRaw(svc.key, { path: svc.cwd, command: svc.command }, true);
   });
 
   ipcMain.handle("service:stop", (_e, svc) => stop(svc.key, { path: svc.cwd }));
@@ -964,19 +936,22 @@ app.whenReady().then(() => {
     return true;
   });
 
+  // PM2's answer costs a process spawn (~1 s), so it is refreshed less often
+  // than the port checks, which take a few milliseconds.
+  let pm2Cache = { at: 0, value: undefined };
   ipcMain.handle("service:status", async () => {
-    const state = {};
-    const mysqlUp = await portOpen(SERVICES.mysql.port, 600);
-    state.mysql = mysqlUp;
-    state.backend = await portOpen(SERVICES.backend.port, 600);
-    const adminUp = await portOpen(SERVICES.admin.port, 600);
-    state.admin = adminUp;
-    return state;
+    const [mysql, backend, admin] = await Promise.all([
+      portOpen(SERVICES.mysql.port, 600),
+      portOpen(SERVICES.backend.port, 600),
+      portOpen(SERVICES.admin.port, 600)
+    ]);
+    if (Date.now() - pm2Cache.at > 15000) {
+      pm2Cache = { at: Date.now(), value: await pm2Status((readConfig().backend || {}).path) };
+    }
+    return { mysql, backend, admin, backendPm2: pm2Cache.value };
   });
 
-  ipcMain.handle("service:run-all", async (_e, cfg) => {
-    return orchestratedStartup(cfg);
-  });
+  ipcMain.handle("service:run-all", (_e, cfg) => orchestratedStartup(cfg));
 
   createWindow();
 
