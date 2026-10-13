@@ -40,26 +40,20 @@ A status dot next to each one is refreshed every 4 seconds from the service port
 Stop while it is down.
 
 Stopping is by port: whatever is LISTENING on the service port is killed, and the
-cmd window it was started in is closed with it. MySQL is asked to shut down with
-mysqladmin first so InnoDB closes cleanly, and is only killed if that fails.
+cmd window it was started in is closed with it.
 
-If the XAMPP Control Panel is open and shows MySQL running, the launcher stops
-MySQL through the panel's own Stop button instead (xampp-panel.ps1). The panel
-reports "MySQL shutdown unexpectedly" for any stop it did not start itself, so
-this is what keeps its log at "Attempting to stop MySQL app... / Status change
-detected: stopped". The panel's Stop kills mysqld, so the launcher flushes the
-tables and InnoDB's dirty pages first. A real crash still shows the panel's error.
+MySQL has three buttons, and each does exactly one thing when you click it:
 
-After MySQL is down, the launcher closes the XAMPP panel with its Quit button, but
-only when every module in it shows Start - quitting with Apache still up would
-leave Apache running with nothing managing it.
+- **Start** - runs mysqld with the configured command and waits until it answers.
+- **Stop** - asks mysqld to shut down (mysqladmin) and waits for it to finish
+  writing. It is never killed, and the XAMPP Control Panel is not touched.
+- **Fix** - stops MySQL cleanly, removes the crash dump and stale .pid files
+  (never data), starts it again and repairs any system table flagged by an
+  unclean stop. Only if that fails does it offer an InnoDB redo-log reset, and
+  only after you confirm; the old logs are kept renamed.
 
-XAMPP 3.3.0's Quit crashes ("Exception EAccessViolation in module
-xampp-control.exe") when it cannot save C:\xampp\xampp-control.ini, which the
-XAMPP installer makes read-only for non-admin users. setup.ps1 grants write
-access to that file. Until it has, or if the panel errors or hangs on the way
-out anyway, the launcher ends the panel process directly instead of showing the
-crash - nothing is lost, since every module is already stopped by then.
+Nothing starts, stops or repairs MySQL on its own. Starting the POS API alone
+with MySQL down just says to press Start on MySQL first.
 
 ## Closing the window
 If any service is still running, the close button asks first:

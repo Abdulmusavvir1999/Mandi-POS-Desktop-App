@@ -293,15 +293,6 @@
       box-shadow: 0 10px 26px #22c98a5c
     }
 
-    .danger {
-      background: linear-gradient(135deg, #f2596e, #d62a44);
-      box-shadow: 0 6px 18px #f0556b3d
-    }
-
-    .danger:hover:not(:disabled) {
-      box-shadow: 0 10px 26px #f0556b5c
-    }
-
     .fix {
       background: linear-gradient(135deg, #f59e0b, #d97706);
       box-shadow: 0 6px 18px #f59e0b3d;
@@ -312,7 +303,7 @@
       box-shadow: 0 10px 26px #f59e0b5c;
     }
 
-    /* Fix button in service button rows: hidden by default, shown only when Settings (⚙) is active */
+    /* Fix is hidden until the Settings (⚙) toggle is on. */
     .btnrow .fix {
       display: none;
     }
@@ -322,47 +313,15 @@
       align-items: center;
       justify-content: center;
       gap: 6px;
-      animation: fadeInFix .25s ease;
     }
 
-    @keyframes fadeInFix {
-      from {
-        opacity: 0;
-        transform: scale(0.95);
-      }
-      to {
-        opacity: 1;
-        transform: scale(1);
-      }
+    .danger {
+      background: linear-gradient(135deg, #f2596e, #d62a44);
+      box-shadow: 0 6px 18px #f0556b3d
     }
 
-    .fix-banner-btn {
-      margin-left: auto;
-      padding: 6px 14px;
-      font-size: 12px;
-      background: linear-gradient(135deg, #f59e0b, #d97706);
-      color: #fff;
-      border: 1px solid #f59e0b88;
-      border-radius: 8px;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-weight: 650;
-      box-shadow: 0 4px 14px #f59e0b50;
-      cursor: pointer;
-      flex: none;
-      animation: pulseFix 1.8s ease-in-out infinite;
-    }
-
-    @keyframes pulseFix {
-      0%, 100% {
-        transform: scale(1);
-        box-shadow: 0 4px 14px #f59e0b50;
-      }
-      50% {
-        transform: scale(1.04);
-        box-shadow: 0 6px 20px #f59e0b80;
-      }
+    .danger:hover:not(:disabled) {
+      box-shadow: 0 10px 26px #f0556b5c
     }
 
     .ghost {
@@ -769,8 +728,7 @@
       background: #5b8cff14
     }
 
-    .retry-banner-btn,
-    .fix-banner-btn {
+    .retry-banner-btn {
       margin-left: auto;
       padding: 6px 13px;
       font-size: 12px;
@@ -790,16 +748,6 @@
 
     .retry-banner-btn:hover {
       background: #4f6ffd;
-      transform: translateY(-1px)
-    }
-
-    .fix-banner-btn {
-      background: #e69138;
-      box-shadow: 0 2px 8px #e691384d
-    }
-
-    .fix-banner-btn:hover {
-      background: #f09f4a;
       transform: translateY(-1px)
     }
 
@@ -1049,7 +997,7 @@
         <div class="btnrow">
           <button class="go" id="mysqlStart" onclick="run('mysql')">Start</button>
           <button class="danger" id="mysqlStop" onclick="stopSvc('mysql')">Stop</button>
-          <button class="fix" id="mysqlFix" onclick="fixMysql(this)" title="Auto-fix table corruption, Aria crashes, or hanging MySQL processes">🔧 Fix</button>
+          <button class="fix" id="mysqlFix" onclick="fixMysql(this)" title="Stop MySQL cleanly, clear crash leftovers, start it and repair flagged system tables. Runs only when clicked.">🔧 Fix</button>
           <span class="state" id="mysqlState"><span class="dot"></span>checking</span>
         </div>
       </div>
@@ -1149,17 +1097,13 @@
     let busy = false;
     const wasUp = {};
 
-    function show(text, state = "", allowFix = false, canRetry = false) {
+    function show(text, state = "", canRetry = false) {
       const el = document.getElementById("status");
       if (!el) return;
       el.className = "status " + state;
-      const isMysqlBad = allowFix || (state === "bad" && (text.includes("MySQL") || text.includes("3306") || text.includes("mysqld") || text.includes("0x80000003") || text.includes("InnoD") || text.includes("crashed")));
       let buttonsHtml = "";
       if (canRetry || state === "bad") {
         buttonsHtml += `<button id="retryBtn" class="retry-banner-btn" onclick="runAll()">🔄 Retry</button>`;
-      }
-      if (isMysqlBad) {
-        buttonsHtml += `<button id="autoFixBtn" class="fix-banner-btn" onclick="fixMysql(this)">🔧 Fix MySQL</button>`;
       }
       el.innerHTML = `<span class="dot ${state}"></span><span style="flex:1;min-width:0;line-height:1.4">${text.replace(/\n/g, "<br>")}</span>` + buttonsHtml;
     }
@@ -1352,22 +1296,23 @@
       }
     }
 
+    // Manual only: nothing calls this except the Fix button.
     async function fixMysql(btn) {
       if (!api || !api.fixMysql) {
         show("Fix MySQL needs the updated launcher. Restart the launcher app.", "bad");
         return;
       }
-      if (btn) working(btn, true);
-      const cardFix = document.getElementById("mysqlFix");
-      if (cardFix && cardFix !== btn) working(cardFix, true);
+      if (busy) return;
+      if (!window.confirm("Fix MySQL will stop MySQL, clear crash leftovers, start it again and repair any flagged system tables. Your data is not changed.\n\nContinue?")) return;
+      working(btn, true);
       setBusy(true, ["mysql"]);
-      show("Auto-repairing MySQL (fixing crashed Aria tables, clearing locks and log sequences)…");
-      log("[Auto-Fix] Starting automatic MySQL repair...");
+      show("Fixing MySQL…", "working");
+      log("[Fix MySQL] Started by the Fix button");
       try {
         await persist();
         const cfg = readConfig().mysql || {};
         let r = await api.fixMysql({ cwd: cfg.path, command: cfg.command });
-        log("[Auto-Fix] " + r.message);
+        log("[Fix MySQL] " + r.message);
         // The safe repair did not help: the redo-log reset can lose the latest
         // transactions, so it only runs when the person agrees to it.
         if (!r.ok && r.needsLogReset) {
@@ -1375,24 +1320,22 @@
             r.message + "\n\nRun the advanced repair now? The current InnoDB logs are kept as a backup (renamed), not deleted."
           );
           if (go) {
-            show("Running the advanced MySQL repair…");
+            show("Running the advanced MySQL repair…", "working");
             r = await api.fixMysql({ cwd: cfg.path, command: cfg.command, allowLogReset: true });
-            log("[Auto-Fix] " + r.message);
+            log("[Fix MySQL] " + r.message);
           }
         }
-        show(r.message, r.ok ? "ok" : "bad", !r.ok);
-        refreshStatus();
+        show(r.message, r.ok ? "ok" : "bad");
       } catch (e) {
-        show("MySQL Fix failed: " + e.message, "bad", true);
-        log("[Auto-Fix Error] " + e.message);
+        show("Fix MySQL failed: " + e.message, "bad");
+        log("[Fix MySQL] " + e.message);
       } finally {
-        if (btn) working(btn, false);
-        if (cardFix && cardFix !== btn) working(cardFix, false);
+        working(btn, false);
         setBusy(false, ["mysql"]);
       }
     }
 
-    // Orchestrated startup: MySQL -> Verify DB -> API -> Verify Health -> Frontend -> Ready
+    // Start everything: MySQL -> open the frontend and API terminals -> done
     async function runAll() {
       if (busy) return;
       const keys = Object.keys(SERVICES);
@@ -1411,7 +1354,7 @@
             log("[STARTUP] System Ready");
           } else {
             const err = (result && (result.error || result.message)) || "Startup failed. See log.";
-            show(err, "bad", false, true);
+            show(err, "bad", true);
             log("[STARTUP][ERROR] " + err);
           }
         } else {
@@ -1423,7 +1366,7 @@
           show("Services started.", "ok");
         }
       } catch (e) {
-        show(e.message, "bad", false, true);
+        show(e.message, "bad", true);
         log("[STARTUP][ERROR] " + e.message);
       } finally {
         working(btn, false);
@@ -1603,7 +1546,7 @@
       if (api.onStartupProgress) {
         api.onStartupProgress(d => {
           if (d.error) {
-            show(d.message, "bad", false, true);
+            show(d.message, "bad", true);
           } else if (d.state === "READY") {
             show(d.message || "System Ready", "ok");
           } else {

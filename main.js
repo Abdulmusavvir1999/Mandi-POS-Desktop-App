@@ -3,13 +3,11 @@ const { spawn, execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const net = require("net");
-const http = require("http");
 const os = require("os");
 
 const PRELOAD = path.join(__dirname, "preload.js");
 const INDEX = path.join(__dirname, "index.html");
 const TRAY_ICON = path.join(__dirname, "tray.png");
-const XAMPP_PANEL = path.join(__dirname, "xampp-panel.ps1");
 
 // POS-Desktop sits next to Advanced-Pos-System-BE and Advanced-Pos-System-FE in the repo, so the
 // defaults follow the folder rather than one machine's absolute paths.
@@ -44,7 +42,6 @@ const StartupState = {
   CHECKING_MYSQL: "CHECKING_MYSQL",
   STARTING_MYSQL: "STARTING_MYSQL",
   WAITING_FOR_MYSQL: "WAITING_FOR_MYSQL",
-  RECOVERING_MYSQL: "RECOVERING_MYSQL",
   CONNECTING_DATABASE: "CONNECTING_DATABASE",
   CHECKING_API: "CHECKING_API",
   STARTING_API: "STARTING_API",
@@ -62,12 +59,19 @@ let currentStartupState = StartupState.IDLE;
 // hidden = background process, no console window, like the XAMPP Start button.
 // terminal = its own cmd window so you can watch the logs.
 const SERVICES = {
-  mysql: { name: "MySQL", mode: "hidden", port: 3306, waitForPortMs: 30000 },
-  backend: { name: "POS API", mode: "terminal", port: 8000, waitAfterMs: 2000 },
-  admin: { name: "POS Frontend", mode: "terminal", port: 8002, waitAfterMs: 0 }
+  mysql: { name: "MySQL", mode: "hidden", port: 3306 },
+  backend: { name: "POS API", mode: "terminal", port: 8000 },
+  admin: { name: "POS Frontend", mode: "terminal", port: 8002 }
 };
 
 const RUN_ORDER = ["mysql", "backend", "admin"];
+
+// Processes this launcher started, by service key. A terminal service's
+// entry is the cmd.exe that owns its window, so Stop can kill that tree
+// directly instead of searching the process table; MySQL's is the cmd /c
+// that waits on mysqld, so Start knows the moment mysqld quits.
+const started = {};
+const startedAlive = (key) => !!(started[key] && started[key].exitCode === null && started[key].signalCode === null);
 
 let win = null;
 let shuttingDown = false;
@@ -202,15 +206,6 @@ function portOpen(port, timeoutMs = 800) {
   ]).then((results) => results.some(Boolean));
 }
 
-async function waitForPort(port, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await portOpen(port)) return true;
-    await wait(700);
-  }
-  return false;
-}
-
 async function waitForPortClosed(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -311,48 +306,6 @@ function runOut(exe, args, timeout = 20000) {
   });
 }
 
-// The XAMPP Control Panel prints "MySQL shutdown unexpectedly" whenever mysqld
-// disappears without its own Stop button having been pressed, however cleanly
-// it went. So while the panel is watching MySQL, stop it through that button;
-// see xampp-panel.ps1. Answers "state=Stop" when the panel is watching.
-async function xamppPanel(mode) {
-  if (!fs.existsSync(XAMPP_PANEL)) return "state=none";
-  const args = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", XAMPP_PANEL];
-  if (mode) args.push(mode);
-  const out = await runOut("powershell.exe", args, 30000);
-  return out === null ? "state=error" : out.trim();
-}
-
-// Once MySQL is down the panel has nothing left to do, so close it. It only
-// quits when every module is stopped, and its MySQL button takes a timer tick
-// to flip back to Start after the port closes - hence the retries on "busy".
-async function closeXamppPanel() {
-  for (let attempt = 0; attempt < 6; attempt++) {
-    const result = await xamppPanel("-Quit");
-    if (result !== "busy") return result;
-    await wait(1000);
-  }
-  return "busy";
-}
-
-// XAMPP's Stop kills mysqld by PID rather than shutting it down, so first get
-// it to where a kill loses nothing: FLUSH TABLES closes the Aria and MyISAM
-// tables, and a zero dirty-page limit makes InnoDB write its buffer pool out.
-// Committed transactions are already in the redo log either way.
-async function mysqlQuiesce(binPath) {
-  const exe = binPath && path.join(binPath, "mysql.exe");
-  if (!exe || !fs.existsSync(exe)) return;
-  const base = ["-u", "root", "--protocol=tcp", "-h", "127.0.0.1", "-N", "-B", "-e"];
-  await runOut(exe, [...base, "SET GLOBAL innodb_max_dirty_pages_pct = 0; FLUSH TABLES;"]);
-  const deadline = Date.now() + 10000;
-  while (Date.now() < deadline) {
-    const out = await runOut(exe, [...base, "SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_dirty'"], 5000);
-    const dirty = out === null ? NaN : Number(out.trim().split(/\s+/)[1]);
-    if (!(dirty > 0)) return;
-    await wait(500);
-  }
-}
-
 async function stop(key, entry) {
   const svc = SERVICES[key] || { name: key };
   const { name, port } = svc;
@@ -364,39 +317,34 @@ async function stop(key, entry) {
   }
 
   if (key === "mysql") {
-    const binPath = entry && entry.path;
-    // Only while the panel shows MySQL running; with no panel watching,
-    // nothing would complain and mysqladmin's clean shutdown is the better stop.
-    if ((await xamppPanel()) === "state=Stop") {
-      await mysqlQuiesce(binPath);
-      if ((await xamppPanel("-Click")) === "clicked" && (await waitForPortClosed(port, 20000))) {
-        sendStatus({ key, name, running: false });
-        const closed = (await closeXamppPanel()).startsWith("quit");
-        return {
-          ok: true,
-          key,
-          message: `${name} stopped through the XAMPP Control Panel${closed ? ", and the panel was closed" : ""}.`
-        };
-      }
-    }
-    await mysqlShutdown(binPath);
-    if (await waitForPortClosed(port, 20000)) {
-      sendStatus({ key, name, running: false });
-      const closed = (await closeXamppPanel()).startsWith("quit");
-      return { ok: true, key, message: `${name} shut down cleanly${closed ? ", and the XAMPP panel was closed" : ""}.` };
+    // Stop = ask mysqld to shut down. That is all - no kill, no XAMPP panel,
+    // no repair. The status dot goes grey by itself once the port closes.
+    await mysqlShutdown(entry && entry.path);
+    const down = await waitForPortClosed(port, MYSQL_BUTTON_WAIT_MS);
+    sendStatus({ key, name, running: !down });
+    ownMysqlVerified = false;
+    return {
+      ok: true,
+      key,
+      message: down ? `${name} stopped.` : `${name} is shutting down - the dot turns grey when it is done.`
+    };
+  }
+
+  if (startedAlive(key)) {
+    // We opened this window: kill its tree straight away, no process search.
+    await run("taskkill", ["/PID", String(started[key].pid), "/T", "/F"]);
+  } else {
+    // Started by something else (or a previous launcher run): find the
+    // listener and the cmd window above it.
+    const pids = await pidsOnPort(port);
+    const table = pids.length ? await processTable() : new Map();
+    for (const pid of pids) {
+      // /T takes the whole tree, so the service dies with its terminal window.
+      await run("taskkill", ["/PID", consoleRootOf(pid, table), "/T", "/F"]);
     }
   }
 
-  const pids = await pidsOnPort(port);
-  const table = pids.length ? await processTable() : new Map();
-  for (const pid of pids) {
-    // /T takes the whole tree, so the service dies with its terminal window.
-    await run("taskkill", ["/PID", consoleRootOf(pid, table), "/T", "/F"]);
-  }
-  // Belt and braces for consoles that do expose their title.
-  await run("taskkill", ["/F", "/FI", `WINDOWTITLE eq  ${name}*`], 8000);
-
-  const down = await waitForPortClosed(port, 8000);
+  const down = await waitForPortClosed(port, MYSQL_BUTTON_WAIT_MS);
   sendStatus({ key, name, running: !down });
   return down
     ? { ok: true, key, message: `${name} stopped.` }
@@ -462,9 +410,12 @@ async function launchRaw(key, entry, checkExisting = true) {
   }
 
   try {
+    // "start /wait" keeps this cmd alive as the parent of the window it
+    // opened, so its pid is enough to kill the whole tree later. (A plain
+    // "cmd /k" would have no console under a detached spawn and exit at once.)
     const args = mode === "hidden"
       ? ["/c", command]
-      : ["/c", "start", ` ${name}`, "cmd", "/k", command];
+      : ["/c", "start", ` ${name}`, "/wait", "cmd", "/k", command];
 
     const env = {};
     for (const [k, v] of Object.entries(process.env)) {
@@ -493,6 +444,7 @@ async function launchRaw(key, entry, checkExisting = true) {
       sendStatus({ key, name, running: false, error: err.message });
     });
     child.unref();
+    started[key] = child;
 
     sendStatus({ key, name, running: true });
     return { ok: true, key, message: `${name} process started.` };
@@ -584,130 +536,37 @@ async function verifyDatabaseConnection(binPath, timeoutMs = 3000) {
   });
 }
 
-async function waitForMySQLReady(binPath, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  let attempt = 1;
-  while (Date.now() < deadline) {
-    const portUp = await portOpen(3306, 600);
-    if (portUp) {
-      sendStartupProgress({
-        state: StartupState.CONNECTING_DATABASE,
-        message: "Testing database connection...",
-        detail: `Attempt ${attempt}`
-      });
-      const dbCheck = await verifyDatabaseConnection(binPath, 1500);
-      if (dbCheck.ok) {
-        sendLog("[STARTUP] MySQL is ready");
-        sendLog("[STARTUP] Database connection successful");
-        sendStatus({ key: "mysql", name: "MySQL", running: true });
-        return { ok: true };
-      } else {
-        sendLog(`[STARTUP] MySQL port 3306 open, waiting for database to accept connections (attempt ${attempt})...`);
-      }
-    } else {
-      sendLog(`[STARTUP] Waiting for MySQL on 127.0.0.1:3306 (attempt ${attempt})...`);
-    }
-    attempt++;
-    await wait(500);
-  }
-  return {
-    ok: false,
-    error: "Unable to start the database.\nMySQL is not responding on 127.0.0.1:3306.\nPlease check that MySQL/XAMPP is installed and configured correctly."
-  };
-}
-
-function checkApiHealth(port = 8000, timeoutMs = 2000) {
-  return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/api/health`, { timeout: timeoutMs }, (res) => {
-      let data = "";
-      res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => {
-        try {
-          const json = JSON.parse(data);
-          resolve(res.statusCode === 200 && json.status === "UP");
-        } catch {
-          resolve(res.statusCode === 200);
-        }
-      });
-    });
-    req.on("timeout", () => { req.destroy(); resolve(false); });
-    req.on("error", () => resolve(false));
-  });
-}
-
-async function waitForApiReady(port = 8000, timeoutMs = 30000) {
-  const deadline = Date.now() + timeoutMs;
-  let attempt = 1;
-  while (Date.now() < deadline) {
-    const healthy = await checkApiHealth(port, 1500);
-    if (healthy) {
-      sendLog("[STARTUP] API is ready");
-      sendStatus({ key: "backend", name: "POS API", running: true });
-      return { ok: true };
-    }
-    sendLog(`[STARTUP] Waiting for API health check on :${port}/api/health (attempt ${attempt})...`);
-    attempt++;
-    await wait(500);
-  }
-  return {
-    ok: false,
-    error: `API server did not respond with healthy status within ${Math.round(timeoutMs / 1000)} seconds.`
-  };
-}
-
-async function launch(key, entry) {
-  const result = await launchRaw(key, entry, true);
-  if (!result.ok || result.alreadyRunning) return result;
-
-  const svc = SERVICES[key] || {};
-  if (svc.waitForPortMs) {
-    const up = await waitForPort(svc.port, svc.waitForPortMs || 20000);
-    sendStatus({ key, name: svc.name, running: up });
-    return up
-      ? { ok: true, key, message: `${svc.name} is up on port ${svc.port}.` }
-      : {
-        ok: false,
-        key,
-        message: `${svc.name}: started but port ${svc.port} never opened. ${lastLoggedError(key, entry && entry.path) || ""}`
-      };
-  }
-
-  return result;
-}
-
 // ════════════════════════════════════════════════════════════════════════
-// MySQL: start, verify and recover - shared by "Start everything" and the
-// Fix MySQL button.
+// MySQL
 //
-// Why MySQL kept failing to start (found in mysql_error.log and reproduced):
-//  1. MySQL was almost never shut down cleanly. The launcher checked port 3306
-//     by opening and dropping raw TCP connections; with enough of those mysqld
-//     accepted "shutdown" but never exited, so stopping ended in a kill.
-//  2. Every next start then ran crash recovery, and the old Fix MySQL ran
-//     aria_chk on the system tables outside the server, which left them
-//     flagged "Corrupt" - e.g. "Table '.\mysql\db' is marked as crashed".
-//  3. Right after start-up, InnoDB's Windows native async I/O failed
-//     ("aio write returned OS error 206") and mysqld died with 0x80000003.
-//     my.ini now sets innodb_use_native_aio=0.
-// Now: port 3306 is checked with netstat and logins (mysqladmin), never raw
-// sockets; MySQL is stopped with mysqladmin and the launcher waits for the
-// process to exit; system tables are repaired through the server; and the
-// automatic recovery never deletes data, databases or InnoDB redo logs and
-// only touches this XAMPP's own mysqld. Resetting the redo logs stays a
-// manual, confirmed step.
+// Start = what the XAMPP panel's Start button does: run mysqld with the
+// configured command and wait until it answers. Nothing else is touched -
+// no repair, no cleanup, no second attempt.
+// Stop = ask mysqld to shut down (mysqladmin) and wait for the process to
+// exit; it is never killed while it is still writing.
 // ════════════════════════════════════════════════════════════════════════
 
-const MYSQL_START_TIMEOUT_MS = 30000;   // waiting for port 3306 + a working connection
-const MYSQL_STABLE_MS = 3000;           // it must stay up this long (the crash came ~1s after "ready")
-const MYSQL_MAX_RECOVERIES = 2;         // automatic recovery attempts before giving up
+const MYSQL_START_TIMEOUT_MS = 60000;
+// The Start button never waits longer than this. If mysqld is still coming up
+// after it, the button returns "starting" and the status dot goes green by itself.
+const MYSQL_BUTTON_WAIT_MS = 5000;
 
-// One recovery at a time, whether it came from startup or from the button.
-let mysqlRecoveryLock = false;
-// Set once this XAMPP's mysqld is verified running, so a Windows shutdown
-// can stop it cleanly (and never another program's MySQL).
+// Fix MySQL and the Start buttons must not run at the same time.
+let mysqlBusy = false;
+
+// Set once this XAMPP's mysqld was started or seen running by the launcher,
+// so a Windows shutdown stops it cleanly.
 let ownMysqlVerified = false;
 
-/** PIDs of mysqld.exe running from this XAMPP's bin folder - nobody else's MySQL. */
+/** MySQL answers mysqladmin ping on 127.0.0.1:3306 (one process, ~100 ms). */
+async function mysqlAlive(binPath, timeoutMs = 3000) {
+  const exe = binPath && path.join(binPath, "mysqladmin.exe");
+  if (!exe || !fs.existsSync(exe)) return (await verifyDatabaseConnection(binPath, timeoutMs)).ok;
+  const out = await runOut(exe, ["-u", "root", "-h", "127.0.0.1", "--protocol=tcp", "ping"], timeoutMs);
+  return !!out && out.toLowerCase().includes("alive");
+}
+
+/** PIDs of live mysqld.exe processes from this XAMPP's bin folder (dead leftovers have no path and are ignored). */
 async function ownMysqldPids(binPath) {
   if (!binPath) return [];
   const out = await runOut("powershell.exe", [
@@ -722,58 +581,154 @@ async function ownMysqldPids(binPath) {
     .map((p) => p.pid);
 }
 
-/** Who holds port 3306: "none", "own" (this XAMPP's mysqld) or "foreign" (another program). */
-async function mysqlPortOwner(binPath) {
-  const pids = (await pidsOnPort(3306)).map(Number);
-  if (!pids.length) return { owner: "none", pids };
-  const own = new Set(await ownMysqldPids(binPath));
-  return { owner: pids.some((p) => own.has(p)) ? "own" : "foreign", pids };
+/** Waits for a mysqld that closed its port but is still writing to disk. True when none is left. */
+async function waitForOwnMysqldExit(binPath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let pids = await ownMysqldPids(binPath);
+  while (pids.length && Date.now() < deadline) {
+    await wait(1000);
+    pids = await ownMysqldPids(binPath);
+  }
+  return pids.length === 0;
 }
 
-/** Stops this XAMPP's mysqld: a clean shutdown first, a kill only if it will not go. */
-async function stopOwnMysqld(binPath) {
-  const { owner } = await mysqlPortOwner(binPath);
-  if (owner === "own") {
-    await mysqlShutdown(binPath);
-    // The port closes first; mysqld then still flushes to disk. Wait for the
-    // process itself to exit - killing it here is what made the next start
-    // need crash recovery.
-    const deadline = Date.now() + 60000;
-    while (Date.now() < deadline && (await ownMysqldPids(binPath)).length) await wait(1000);
+/**
+ * Start MySQL.
+ *  1. Already answering -> done (never restarted).
+ *  2. Port 3306 taken by something that is not answering -> say so, touch nothing.
+ *  3. Otherwise run mysqld and wait until it answers.
+ * With quick = true (the Start button) the wait is capped at MYSQL_BUTTON_WAIT_MS:
+ * a mysqld that is still coming up counts as started ({ ok, starting }).
+ */
+async function startMysql(mysqlCfg, quick = false) {
+  const binPath = mysqlCfg.path;
+  sendStartupProgress({ state: StartupState.CHECKING_MYSQL, message: "Checking MySQL...", step: 1, total: 5 });
+
+  if (await mysqlAlive(binPath)) {
+    sendLog("[MySQL] Already running.");
+    ownMysqlVerified = true;
+    sendStatus({ key: "mysql", name: "MySQL", running: true });
+    return { ok: true };
   }
-  // Only a mysqld that crashed half-way or did not exit within a minute.
+
+  if (await portOpen(3306, 600)) {
+    return {
+      ok: false,
+      error: "Port 3306 is in use, but MySQL is not answering on it.\nIf MySQL was just started, try again in a few seconds. Otherwise close the program using port 3306."
+    };
+  }
+
+  sendLog("[MySQL] Starting...");
+  sendStartupProgress({ state: StartupState.STARTING_MYSQL, message: "Starting database...", step: 1, total: 5 });
+  const launched = await launchRaw("mysql", mysqlCfg, false);
+  if (!launched.ok) return { ok: false, error: launched.message };
+
+  sendStartupProgress({ state: StartupState.WAITING_FOR_MYSQL, message: "Waiting for MySQL...", step: 2, total: 5 });
+  const deadline = Date.now() + (quick ? MYSQL_BUTTON_WAIT_MS : MYSQL_START_TIMEOUT_MS);
+  while (Date.now() < deadline) {
+    if (await mysqlAlive(binPath, 1500)) {
+      sendLog("[MySQL] Ready.");
+      ownMysqlVerified = true;
+      sendStatus({ key: "mysql", name: "MySQL", running: true });
+      return { ok: true };
+    }
+    // mysqld exited: it logged why - stop waiting and show it.
+    if (!startedAlive("mysql")) break;
+    await wait(300);
+  }
+  if (quick && startedAlive("mysql")) {
+    sendLog("[MySQL] Started - still coming up.");
+    ownMysqlVerified = true;
+    return { ok: true, starting: true };
+  }
+  const reason = lastLoggedError("mysql", binPath);
+  return {
+    ok: false,
+    error: `Unable to start the database.\nMySQL is not responding on 127.0.0.1:3306.\n${reason ? "Log: " + reason + "\n" : ""}Check the XAMPP MySQL log, then press Start again.`
+  };
+}
+
+/** Asks this XAMPP's mysqld to shut down and waits for the process to exit. Used by Fix only. */
+async function stopOwnMysqld(binPath) {
+  if (await portOpen(3306, 600)) {
+    await mysqlShutdown(binPath);
+    if (!(await waitForOwnMysqldExit(binPath, 30000))) {
+      sendLog("[Fix MySQL] Shut down but the process has not exited yet - asking once more...");
+      await mysqlShutdown(binPath);
+      await waitForOwnMysqldExit(binPath, 30000);
+    }
+  }
+  // Last resort: a mysqld that crashed half-way or stayed stuck for a minute.
   for (const pid of await ownMysqldPids(binPath)) {
-    sendLog(`[MySQL] Stopping hung mysqld (PID ${pid})...`);
+    sendLog(`[Fix MySQL] Hung mysqld (PID ${pid}) did not exit - stopping it by force.`);
     await run("taskkill", ["/PID", String(pid), "/F"], 8000);
   }
   await wait(800);
 }
 
 /**
- * Clean-up on a STOPPED server, before starting it again: only the leftovers
- * of a crash - the crash dump and stale .pid files. Nothing that holds data.
- *
- * Deliberately NOT done any more (the old Fix MySQL did both):
- *  - aria_chk on the system tables: editing Aria files outside the server
- *    leaves them out of step with the server's Aria log, and the server then
- *    marks every one of them "Corrupt / from another system" - verified on
- *    this machine. System tables are repaired through the running server
- *    instead (repairSystemTablesOnline).
- *  - copying tables from xampp/mysql/backup: files from another install have
- *    the same problem.
+ * Fix MySQL. Runs only when the Fix button is clicked - never on its own.
+ *  1. stop mysqld cleanly;
+ *  2. remove the crash dump and stale .pid files (never data);
+ *  3. start it;
+ *  4. repair, through the running server, any system table the last unclean
+ *     stop left flagged (REPAIR TABLE keeps the rows).
+ * Only if that fails, and only after the person confirms it, the InnoDB redo
+ * logs are reset - the old logs are kept renamed, never deleted.
  */
-async function repairMysqlFilesSafely(binPath) {
-  const dataDir = path.resolve(binPath, "..", "data");
-  const done = [];
-  if (!fs.existsSync(dataDir)) return done;
-  const dmp = path.join(dataDir, "mysqld.dmp");
-  try { if (fs.existsSync(dmp)) { fs.unlinkSync(dmp); done.push("removed mysqld.dmp"); } } catch { /* in use: leave it */ }
+async function fixMysqlService(entry) {
+  if (mysqlBusy || startupLock) {
+    return { ok: false, key: "mysql", message: "MySQL is already being started or repaired - wait for it to finish." };
+  }
+  mysqlBusy = true;
   try {
-    for (const file of fs.readdirSync(dataDir)) {
-      if (file.endsWith(".pid")) { try { fs.unlinkSync(path.join(dataDir, file)); done.push(`removed ${file}`); } catch { } }
+    const cfg = readConfig().mysql || {};
+    const binPath = (entry && entry.cwd) || (entry && entry.path) || cfg.path || DEFAULT_CONFIG.mysql.path;
+    const command = (entry && entry.command) || cfg.command || DEFAULT_CONFIG.mysql.command;
+    const dataDir = path.resolve(binPath, "..", "data");
+    const mysqlCfg = { path: binPath, command };
+
+    sendStatus({ key: "mysql", name: "MySQL", running: false });
+    sendLog("[Fix MySQL] Stopping MySQL cleanly...");
+    await stopOwnMysqld(binPath);
+
+    for (const name of ["mysqld.dmp", ...((fs.existsSync(dataDir) ? fs.readdirSync(dataDir) : []).filter((f) => f.endsWith(".pid")))]) {
+      try { fs.unlinkSync(path.join(dataDir, name)); sendLog(`[Fix MySQL] removed ${name}`); } catch { /* absent or in use */ }
     }
-  } catch { }
-  return done;
+
+    let result = await startMysql(mysqlCfg);
+    if (result.ok) {
+      const repaired = await repairSystemTablesOnline(binPath);
+      if (repaired.length) sendLog(`[Fix MySQL] System tables repaired: ${repaired.join(", ")}`);
+      sendStatus({ key: "mysql", name: "MySQL", running: true });
+      return { ok: true, key: "mysql", message: "MySQL is running. Your data was not changed." };
+    }
+
+    if (!(entry && entry.allowLogReset)) {
+      return {
+        ok: false,
+        key: "mysql",
+        needsLogReset: true,
+        message: `The safe repair did not get MySQL running.\n${result.error}\nAn advanced repair can reset the InnoDB redo logs, but it may lose the most recent transactions.`
+      };
+    }
+
+    sendLog("[Fix MySQL] Advanced repair confirmed: resetting the InnoDB redo logs (old logs kept).");
+    await stopOwnMysqld(binPath);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    for (const name of ["ib_logfile0", "ib_logfile1"]) {
+      const file = path.join(dataDir, name);
+      try { if (fs.existsSync(file)) fs.renameSync(file, path.join(dataDir, `${name}.bak-${stamp}`)); } catch { /* keep going */ }
+    }
+    result = await startMysql(mysqlCfg);
+    if (result.ok) {
+      sendStatus({ key: "mysql", name: "MySQL", running: true });
+      return { ok: true, key: "mysql", message: `MySQL running after resetting the redo logs. The old logs were kept as ib_logfile*.bak-${stamp}.` };
+    }
+    return { ok: false, key: "mysql", message: `MySQL still does not start.\n${result.error}` };
+  } finally {
+    mysqlBusy = false;
+  }
 }
 
 /**
@@ -795,128 +750,19 @@ async function repairSystemTablesOnline(binPath) {
     if (table && /^\s*error\s*:/i.test(line) && !bad.includes(table)) bad.push(table);
   }
   if (!bad.length) return [];
-  sendLog(`[MySQL] Repairing system tables through the server: ${bad.join(", ")}`);
+  sendLog(`[Fix MySQL] Repairing system tables through the server: ${bad.join(", ")}`);
   await runOut(check, ["-u", "root", "-h", "127.0.0.1", "--protocol=tcp", "--repair", "--tables", "mysql", ...bad.map((t) => t.split(".")[1])], 120000);
   return bad;
 }
 
-/** Up AND staying up: the 0x80000003 crash came about a second after "ready". */
-async function mysqlStaysUp(binPath, ms = MYSQL_STABLE_MS) {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    if (!(await portOpen(3306, 600))) return false;
-    await wait(500);
-  }
-  return (await verifyDatabaseConnection(binPath, 2500)).ok;
-}
-
-/** Starts this XAMPP's mysqld (if needed) and waits until it answers and stays up. */
-async function startMysqlAndVerify(mysqlCfg) {
-  if (!(await portOpen(3306, 600))) {
-    const launched = await launchRaw("mysql", mysqlCfg, false);
-    if (!launched.ok) return { ok: false, error: launched.message };
-  }
-  const ready = await waitForMySQLReady(mysqlCfg.path, MYSQL_START_TIMEOUT_MS);
-  if (!ready.ok) return { ok: false, error: lastLoggedError("mysql", mysqlCfg.path) || "MySQL did not answer on 127.0.0.1:3306." };
-  sendStartupProgress({ state: StartupState.CONNECTING_DATABASE, message: "Verifying database connection...", step: 2, total: 5 });
-  if (!(await mysqlStaysUp(mysqlCfg.path))) {
-    return { ok: false, crashedAfterStart: true, error: lastLoggedError("mysql", mysqlCfg.path) || "MySQL stopped right after starting." };
-  }
-  ownMysqlVerified = true;
-  return { ok: true };
-}
-
-/** After a recovery: repair any system tables the unclean stop left flagged, through the server. */
-async function repairSystemTablesAfterRecovery(binPath) {
-  const repaired = await repairSystemTablesOnline(binPath);
-  if (repaired.length) sendLog(`[MySQL] System tables repaired: ${repaired.join(", ")}`);
-}
-
 /**
- * Brings MySQL up for startup: reuse a healthy server, otherwise start it,
- * otherwise run the safe recovery (stop own mysqld -> safe repairs -> start)
- * up to MYSQL_MAX_RECOVERIES times. Progress only - no error is shown while
- * recovery is still trying.
- */
-async function ensureMysqlReady(mysqlCfg) {
-  const binPath = mysqlCfg.path;
-  sendStartupProgress({ state: StartupState.CHECKING_MYSQL, message: "Checking MySQL connection...", step: 1, total: 5 });
-
-  const port = await mysqlPortOwner(binPath);
-  if (port.owner === "foreign") {
-    // Another program owns 3306. Use it if it is a working MySQL; never stop it.
-    const conn = await verifyDatabaseConnection(binPath, 2500);
-    if (conn.ok) {
-      sendLog(`[STARTUP] Port 3306 is held by another MySQL (PID ${port.pids.join(", ")}); using it as it is.`);
-      return { ok: true };
-    }
-    return {
-      ok: false,
-      fatal: true,
-      error: `Port 3306 is in use by another program (PID ${port.pids.join(", ")}) that is not answering as MySQL.\nClose that program (or change its port) and press Retry.`
-    };
-  }
-
-  if (port.owner === "own") {
-    const conn = await verifyDatabaseConnection(binPath, 2500);
-    if (conn.ok && (await mysqlStaysUp(binPath, 1500))) {
-      sendLog("[STARTUP] MySQL is already running and verified - reusing it.");
-      ownMysqlVerified = true;
-      sendStatus({ key: "mysql", name: "MySQL", running: true });
-      return { ok: true };
-    }
-    sendLog("[STARTUP] MySQL is running but not answering - it will be restarted.");
-  } else {
-    sendLog("[STARTUP] Starting MySQL...");
-    sendStartupProgress({ state: StartupState.STARTING_MYSQL, message: "Starting database...", step: 1, total: 5 });
-    const first = await startMysqlAndVerify(mysqlCfg);
-    if (first.ok) return first;
-    sendLog(`[STARTUP] MySQL did not start cleanly: ${first.error}`);
-  }
-
-  // Safe automatic recovery - the same steps as Fix MySQL, minus anything risky.
-  mysqlRecoveryLock = true;
-  try {
-    let last = "";
-    for (let attempt = 1; attempt <= MYSQL_MAX_RECOVERIES; attempt++) {
-      sendStartupProgress({
-        state: StartupState.RECOVERING_MYSQL,
-        message: `Recovering database startup... (attempt ${attempt} of ${MYSQL_MAX_RECOVERIES})`,
-        step: 1,
-        total: 5
-      });
-      sendLog(`[RECOVERY] Attempt ${attempt}: stopping MySQL cleanly and repairing safely...`);
-      await stopOwnMysqld(binPath);
-      const repaired = await repairMysqlFilesSafely(binPath);
-      if (repaired.length) sendLog(`[RECOVERY] ${repaired.join(", ")}`);
-      const res = await startMysqlAndVerify(mysqlCfg);
-      if (res.ok) {
-        sendLog(`[RECOVERY] MySQL recovered on attempt ${attempt}.`);
-        await repairSystemTablesAfterRecovery(binPath);
-        return res;
-      }
-      last = res.error;
-      sendLog(`[RECOVERY] Attempt ${attempt} failed: ${last}`);
-      await wait(1500 * attempt);
-    }
-    return {
-      ok: false,
-      error: `Unable to start the database.\nMySQL is not responding on 127.0.0.1:3306 after ${MYSQL_MAX_RECOVERIES} automatic recovery attempts.\n${last ? "Log: " + last + "\n" : ""}Your data was not changed. Press Retry, or Fix MySQL for the advanced repair.`
-    };
-  } finally {
-    mysqlRecoveryLock = false;
-  }
-}
-
-/**
- * Start order: MySQL (verified, recovered if needed) -> frontend (starts
- * compiling straight away) -> API (health check includes the database) ->
- * frontend answering -> ready. A failed step stops here with Retry; nothing
- * carries on in a half-started state.
+ * Start everything: MySQL (wait until it answers) -> open the frontend and
+ * API terminals -> done. The terminals are not waited for; their status dots
+ * turn green by themselves when their ports open.
  */
 async function orchestratedStartup(cfg) {
-  if (startupLock || mysqlRecoveryLock) {
-    sendLog("[STARTUP] Startup or MySQL recovery already in progress. Ignoring duplicate start request.");
+  if (startupLock || mysqlBusy) {
+    sendLog("[STARTUP] Startup or Fix MySQL already in progress. Ignoring duplicate start request.");
     return { ok: false, message: "Startup is already in progress. Please wait." };
   }
 
@@ -934,73 +780,26 @@ async function orchestratedStartup(cfg) {
 
     // ── 1. MySQL ───────────────────────────────────────────────────────────
     const mysqlCfg = config.mysql || DEFAULT_CONFIG.mysql;
-    const mysql = await ensureMysqlReady(mysqlCfg);
+    const mysql = await startMysql(mysqlCfg);
     if (!mysql.ok) return fail("mysql", mysql.error);
     sendStatus({ key: "mysql", name: "MySQL", running: true });
     sendLog("[STARTUP] Database connected successfully");
     sendStartupProgress({ state: StartupState.CONNECTING_DATABASE, message: "Database connected successfully.", step: 2, total: 5 });
 
-    // ── 2. Open both terminals at once: frontend and API ───────────────────
-    // The API is only started now that MySQL is verified. Neither waits for
-    // the other - the frontend builds in its own window meanwhile.
-    const adminCfg = config.admin || DEFAULT_CONFIG.admin;
-    const backendCfg = config.backend || DEFAULT_CONFIG.backend;
+    // ── 2. Open both terminals ────────────────────────────────────────────
     sendStartupProgress({ state: StartupState.STARTING_API, message: "Opening the frontend and API terminals...", step: 3, total: 5 });
-
-    let frontendUp = await portOpen(8002, 800);
-    if (frontendUp) {
-      sendLog("[STARTUP] POS Frontend is already running on port 8002");
-      sendStatus({ key: "admin", name: "POS Frontend", running: true });
-    } else {
-      sendLog("[STARTUP] Starting POS Frontend...");
-      const launchFe = await launchRaw("admin", adminCfg, false);
-      if (!launchFe.ok) return fail("admin", `The frontend could not start.
-${launchFe.message}`);
+    const results = [{ key: "mysql", ok: true, message: "MySQL is ready" }];
+    for (const key of ["admin", "backend"]) {
+      const r = await launchRaw(key, config[key] || DEFAULT_CONFIG[key], true);
+      sendLog(`[STARTUP] ${r.message}`);
+      if (!r.ok) return fail(key, r.message);
+      results.push({ key, ok: true, message: r.message });
     }
 
-    let apiUp = await checkApiHealth(8000, 1500);
-    if (apiUp) {
-      sendLog("[STARTUP] API is already running and connected to the database");
-      sendStatus({ key: "backend", name: "POS API", running: true });
-    } else {
-      // Something on 8000 that is not a healthy API: stop it so there is one API only.
-      if ((await pidsOnPort(8000)).length > 0) {
-        sendLog("[STARTUP] Cleaning up existing non-responsive listener on port 8000...");
-        await stop("backend", backendCfg);
-        await wait(600);
-      }
-      sendLog("[STARTUP] Starting POS API...");
-      const launchApi = await launchRaw("backend", backendCfg, false);
-      if (!launchApi.ok) return fail("backend", `Database is ready, but the API server could not start.
-${launchApi.message}`);
-
-      // ── 3. Wait for the API only (seconds). Its health check includes the database.
-      sendStartupProgress({ state: StartupState.WAITING_FOR_API, message: "Waiting for the API and its database connection...", step: 4, total: 5 });
-      const waitApi = await waitForApiReady(8000, 45000);
-      if (!waitApi.ok) {
-        const lastErr = lastLoggedError("backend", backendCfg.path);
-        return fail("backend", `Database is ready, but the API server could not start.
-${lastErr ? "Error: " + lastErr : waitApi.error}`);
-      }
-    }
-
-    // ── 4. Done. The frontend is not waited for: its status dot turns green
-    // by itself when the build finishes (the page polls every few seconds).
-    frontendUp = frontendUp || (await portOpen(8002, 800));
-    const message = frontendUp
-      ? "System Ready"
-      : "Database and API ready. The frontend is building in its window - it turns green when ready.";
+    const message = "Terminals opened. Each dot turns green when its service is up.";
     sendLog(`[STARTUP] ${message}`);
     sendStartupProgress({ state: StartupState.READY, message, step: 5, total: 5 });
-    return {
-      ok: true,
-      message,
-      results: [
-        { key: "mysql", ok: true, message: "MySQL is ready" },
-        { key: "backend", ok: true, message: "POS API is healthy and connected to the database" },
-        { key: "admin", ok: true, message: frontendUp ? "POS Frontend is running" : "POS Frontend is building" }
-      ]
-    };
+    return { ok: true, message, results };
   } catch (err) {
     return fail("startup", `Startup failed: ${err.message}`);
   } finally {
@@ -1018,70 +817,6 @@ async function stopEverything(cfg) {
   }
   ownMysqlVerified = false;
   return results;
-}
-
-/**
- * Fix MySQL button. Runs the same safe recovery as startup. Only when that
- * does not help, and only when the person confirmed it (allowLogReset), does
- * it reset the InnoDB redo logs - which can lose the latest transactions, so
- * the old logs are kept (renamed with a timestamp), never deleted.
- */
-async function fixMysqlService(entry) {
-  if (mysqlRecoveryLock || startupLock) {
-    return { ok: false, key: "mysql", message: "MySQL startup or recovery is already running - wait for it to finish." };
-  }
-  mysqlRecoveryLock = true;
-  try {
-    const cfg = readConfig().mysql || {};
-    const binPath = (entry && entry.cwd) || (entry && entry.path) || cfg.path || "C:\\xampp\\mysql\\bin";
-    const command = (entry && entry.command) || cfg.command || "mysqld.exe --defaults-file=C:\\xampp\\mysql\\bin\\my.ini --standalone";
-    const dataDir = path.resolve(binPath, "..", "data");
-    const mysqlCfg = { path: binPath, command };
-
-    const port = await mysqlPortOwner(binPath);
-    if (port.owner === "foreign") {
-      return { ok: false, key: "mysql", message: `Port 3306 is used by another program (PID ${port.pids.join(", ")}). Fix MySQL will not stop it - close it first.` };
-    }
-
-    sendStatus({ key: "mysql", name: "MySQL", running: false });
-    sendLog("[Auto-Fix] Stopping MySQL cleanly and running the safe repairs...");
-    await stopOwnMysqld(binPath);
-    const repaired = await repairMysqlFilesSafely(binPath);
-    if (repaired.length) sendLog(`[Auto-Fix] ${repaired.join(", ")}`);
-
-    let result = await startMysqlAndVerify(mysqlCfg);
-    if (result.ok) {
-      await repairSystemTablesAfterRecovery(binPath);
-      sendStatus({ key: "mysql", name: "MySQL", running: true });
-      return { ok: true, key: "mysql", message: "MySQL repaired and running. Your data was not changed." };
-    }
-
-    if (!(entry && entry.allowLogReset)) {
-      return {
-        ok: false,
-        key: "mysql",
-        needsLogReset: true,
-        message: `The safe repair did not get MySQL running.\n${result.error}\nAn advanced repair can reset the InnoDB redo logs, but it may lose the most recent transactions.`
-      };
-    }
-
-    // Advanced repair - explicitly confirmed. The old logs are kept, renamed.
-    sendLog("[Auto-Fix] Advanced repair confirmed: resetting the InnoDB redo logs (old logs kept).");
-    await stopOwnMysqld(binPath);
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-    for (const name of ["ib_logfile0", "ib_logfile1"]) {
-      const file = path.join(dataDir, name);
-      try { if (fs.existsSync(file)) fs.renameSync(file, path.join(dataDir, `${name}.bak-${stamp}`)); } catch { }
-    }
-    result = await startMysqlAndVerify(mysqlCfg);
-    if (result.ok) {
-      sendStatus({ key: "mysql", name: "MySQL", running: true });
-      return { ok: true, key: "mysql", message: `MySQL running after resetting the redo logs. The old logs were kept as ib_logfile*.bak-${stamp}.` };
-    }
-    return { ok: false, key: "mysql", message: `MySQL still does not start.\n${result.error}` };
-  } finally {
-    mysqlRecoveryLock = false;
-  }
 }
 
 /**
@@ -1196,80 +931,22 @@ app.whenReady().then(() => {
   });
 
   ipcMain.handle("service:run", async (_e, svc) => {
-    if (startupLock) {
+    if (startupLock || mysqlBusy) {
       return { ok: false, message: "Startup is already in progress. Please wait." };
     }
 
     const key = svc.key;
     const config = readConfig();
 
-    if (key === "backend") {
-      // If user starts backend individually, make sure MySQL is ready first!
-      const mysqlPortOpen = await portOpen(3306, 800);
-      const mysqlCfg = config.mysql || DEFAULT_CONFIG.mysql;
-      let mysqlReady = false;
-      if (mysqlPortOpen) {
-        const testConn = await verifyDatabaseConnection(mysqlCfg.path, 2000);
-        mysqlReady = testConn.ok;
-      }
-
-      if (!mysqlReady) {
-        sendLog("[STARTUP] POS API requires MySQL. Starting MySQL first...");
-        sendStartupProgress({
-          state: StartupState.STARTING_MYSQL,
-          message: "Starting database for API...",
-          step: 1,
-          total: 3
-        });
-        await launchRaw("mysql", mysqlCfg, false);
-        const waitMysql = await waitForMySQLReady(mysqlCfg.path, 30000);
-        if (!waitMysql.ok) {
-          return { ok: false, message: waitMysql.error };
-        }
-      }
-
-      if (await checkApiHealth(8000, 1000)) {
-        sendStatus({ key: "backend", name: "POS API", running: true });
-        return { ok: true, key: "backend", message: "POS API is already running and healthy." };
-      }
-
-      sendLog("[STARTUP] Starting API...");
-      sendStartupProgress({
-        state: StartupState.STARTING_API,
-        message: "Starting server...",
-        step: 2,
-        total: 3
-      });
-      const result = await launchRaw("backend", { path: svc.cwd, command: svc.command }, false);
-      if (!result.ok && !result.alreadyRunning) return result;
-      const waitApi = await waitForApiReady(8000, 30000);
-      if (!waitApi.ok) return { ok: false, message: waitApi.error };
-      sendStartupProgress({
-        state: StartupState.READY,
-        message: "API Server Ready",
-        step: 3,
-        total: 3
-      });
-      return { ok: true, key: "backend", message: "POS API is ready on port 8000." };
-    }
-
     if (key === "mysql") {
-      const mysqlCfg = { path: svc.cwd, command: svc.command };
-      if (await portOpen(3306, 800)) {
-        const testConn = await verifyDatabaseConnection(mysqlCfg.path, 2000);
-        if (testConn.ok) {
-          sendStatus({ key: "mysql", name: "MySQL", running: true });
-          return { ok: true, key: "mysql", message: "MySQL was already running and ready on port 3306." };
-        }
-      }
-      const result = await launchRaw("mysql", mysqlCfg, false);
-      if (!result.ok && !result.alreadyRunning) return result;
-      const waitMysql = await waitForMySQLReady(mysqlCfg.path, 30000);
-      if (!waitMysql.ok) return { ok: false, message: waitMysql.error };
-      return { ok: true, key: "mysql", message: "MySQL is up and accepting connections on port 3306." };
+      const result = await startMysql({ path: svc.cwd, command: svc.command }, true);
+      return result.ok
+        ? { ok: true, key: "mysql", message: result.starting ? "MySQL started - the dot turns green as soon as it answers." : "MySQL is running on port 3306." }
+        : { ok: false, key: "mysql", message: result.error };
     }
 
-    return launch(key, { path: svc.cwd, command: svc.command });
+    // Terminal services: open the window, run the command, done.
+    return launchRaw(key, { path: svc.cwd, command: svc.command }, true);
   });
 
   ipcMain.handle("service:stop", (_e, svc) => stop(svc.key, { path: svc.cwd }));
@@ -1291,8 +968,7 @@ app.whenReady().then(() => {
     const state = {};
     const mysqlUp = await portOpen(SERVICES.mysql.port, 600);
     state.mysql = mysqlUp;
-    const apiHealthy = await checkApiHealth(SERVICES.backend.port, 800);
-    state.backend = apiHealthy;
+    state.backend = await portOpen(SERVICES.backend.port, 600);
     const adminUp = await portOpen(SERVICES.admin.port, 600);
     state.admin = adminUp;
     return state;
